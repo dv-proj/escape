@@ -143,7 +143,11 @@ services:
       BASE_URL: https://${DOMAIN:?DOMAIN is required}
       RATE_LIMIT_RPS: "10"
       RANDOM_DATA_SUFFIX: ${RANDOM_DATA_SUFFIX:?RANDOM_DATA_SUFFIX is required}
+      PAGE_SEED: ${PAGE_SEED:?PAGE_SEED is required}
       TZ: ${TZ:-UTC}
+    volumes:
+      # Decoy page (page.html), generated on first start and editable by hand.
+      - ${DATA_DIR:-./data}/fakeapp:/data
     tmpfs:
       - /tmp
     networks:

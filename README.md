@@ -77,7 +77,7 @@ sudo ./vpn.sh deploy
 
 1. Ставит пакеты, создает пользователя `vpn` (по умолчанию), включает lingering, настраивает sysctl `net.ipv4.ip_unprivileged_port_start=80` (`/etc/sysctl.d/99-vpn-rootless.conf`), ставит rootless Docker.
 2. Копирует проект в `~vpn/vpn-stack` (`VPN_DIR`).
-3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`, `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
+3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`, `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, `PAGE_SEED`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
 4. Создает временный самоподписанный сертификат, запускает стек и выпускает сертификат Let's Encrypt.
 5. Настраивает панель и создает входы `reality` и `xhttp`.
 
@@ -147,6 +147,7 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `ACME_SERVER` | по умолчанию | `letsencrypt` или `letsencrypt_test` (staging) |
 | `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` | вручную | Вид сайта-обманки (`Notely`, ...) |
 | `RANDOM_DATA_SUFFIX` | сгенерировано | Суффикс адреса случайных данных сайта-обманки (hex, 8-12 символов) |
+| `PAGE_SEED` | сгенерировано | Seed страницы-приманки (32 hex-символа); из него один раз генерируется `data/fakeapp/page.html` |
 | `TZ` | по умолчанию | Часовой пояс контейнеров (`Europe/Amsterdam`) |
 | `PANEL_PATH` | сгенерировано | Секретный путь панели |
 | `PANEL_USERNAME` | вручную/`admin` | Логин панели |
@@ -168,6 +169,25 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 - Логин, пароль или путь панели: `scripts/xui.sh configure-panel` (он сам перезапускает xui), затем `vpn.sh restart`, чтобы nginx получил новый `PANEL_PATH`.
 - `XHTTP_PATH`: исправьте путь во входе `xhttp` в панели и перезапустите стек. Клиентам нужны новые ссылки.
 - Ключи REALITY, `REALITY_SHORT_ID`, `CLIENT_UUID`: `provision` не меняет существующие входы (создает их, только если нет входов с такими именами). Обновите значения в панели вручную или удалите входы `reality`/`xhttp` и запустите `scripts/xui.sh provision`. Клиенты должны получить новые ссылки (`vpn.sh links`).
+
+### Страница-приманка
+
+Страница входа сайта-обманки не шаблонная: разметка, CSS, имена классов и id, порядок тегов, тексты и необязательные элементы (ссылка «Forgot password?», «Remember me», подвал) выбираются детерминированно из `PAGE_SEED`, поэтому у разных развертываний HTML разный. При первом запуске `fakeapp` записывает результат в `$VPN_DIR/data/fakeapp/page.html` (обычный Go `html/template`, его можно править) и дальше читает этот файл.
+
+- Файл принадлежит пользователю контейнера (uid 65532, каталог с правами 700), поэтому с хоста его правят через одноразовый контейнер с образом `ACME_IMAGE` (команды от пользователя `vpn`, как в разделе «Вспомогательные скрипты», из `~/vpn-stack`):
+
+  ```bash
+  IMG=neilpang/acme.sh:3.1.6   # значение ACME_IMAGE из .env
+  docker run --rm --network none -v "$PWD/data/fakeapp:/d" --entrypoint cat $IMG /d/page.html > page.html
+  nano page.html
+  docker run --rm -i --network none -v "$PWD/data/fakeapp:/d" --entrypoint /bin/sh $IMG -c 'cat > /d/page.html' < page.html
+  docker compose restart fakeapp
+  ```
+
+- Если файл не разбирается как шаблон, в логе `fakeapp` будет ошибка, а страница отдается сгенерированная (файл не перезаписывается).
+- Чтобы заново сгенерировать страницу из `PAGE_SEED`, удалите файл (`docker run --rm -v "$PWD/data/fakeapp:/d" --entrypoint rm $IMG -f /d/page.html`) и выполните `docker compose restart fakeapp`.
+- Для другого варианта измените `PAGE_SEED` в `.env` (любые 16-64 символа `0-9a-f`), удалите файл и выполните `vpn.sh restart`.
+- Данные шаблона: `.AppName`, `.Description`, `.Keywords`, `.BaseURL`, `.JSONLD`, `.Nonce` (обязателен в `<style>`/`<script>` из-за CSP), `.Time`, `.UnixMilli`, `.OffsetSec`, `.Year`, `.HideForm` и `.State` (`""`, `"invalid"` для 401, `"throttled"` для 429). Поля формы `username`/`password` и `action="/login"` менять не нужно.
 
 ## 7. Варианты использования
 

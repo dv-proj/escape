@@ -17,14 +17,24 @@ type Config struct {
 	RateLimit   float64
 	// RandomSuffix makes the data endpoint /random-<suffix>.
 	RandomSuffix string
+	// PageSeed selects the generated page variant; PageFile is where the
+	// (editable) page template is stored. Empty PageFile means memory only.
+	PageSeed string
+	PageFile string
 }
 
-var suffixRe = regexp.MustCompile(`^[0-9a-f]{8,12}$`)
+var (
+	suffixRe = regexp.MustCompile(`^[0-9a-f]{8,12}$`)
+	seedRe   = regexp.MustCompile(`^[0-9a-f]{16,64}$`)
+)
 
 // validate reports whether the config is usable.
 func (c Config) validate() error {
 	if !suffixRe.MatchString(c.RandomSuffix) {
 		return fmt.Errorf("RANDOM_DATA_SUFFIX must match ^[0-9a-f]{8,12}$")
+	}
+	if !seedRe.MatchString(c.PageSeed) {
+		return fmt.Errorf("PAGE_SEED must match ^[0-9a-f]{16,64}$")
 	}
 	return nil
 }
@@ -51,5 +61,7 @@ func loadConfig() Config {
 		BaseURL:      getenv("BASE_URL", ""),
 		RateLimit:    rps,
 		RandomSuffix: os.Getenv("RANDOM_DATA_SUFFIX"),
+		PageSeed:     os.Getenv("PAGE_SEED"),
+		PageFile:     getenv("PAGE_FILE", "/data/page.html"),
 	}
 }

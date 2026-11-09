@@ -13,7 +13,19 @@ Decoy corporate login page served to non-VPN visitors. Plain HTTP and h2c on `LI
 | `BASE_URL` | empty | canonical link and `og:url` (e.g. `https://example.com`) |
 | `RATE_LIMIT_RPS` | `10` | global token bucket (burst = RPS), excess gets 429 |
 | `RANDOM_DATA_SUFFIX` | required | lowercase hex, 8-12 chars; the data endpoint is `/random-<suffix>`; the app exits at startup if missing or invalid |
+| `PAGE_SEED` | required | 16-64 lowercase hex chars; seed of the generated login page variant; the app exits at startup if missing or invalid |
+| `PAGE_FILE` | `/data/page.html` | the page template (Go `html/template`); empty string disables the file (memory only) |
 | `TZ` | system | timezone of displayed time |
+
+## Decoy page
+
+The login page is not a fixed template: `pagegen.go` generates it from `PAGE_SEED` (class names and ids, head tag order, CSS rule/property order, indentation, wrappers, optional help link / remember-me / footer, wording of every text including the 401 and 429 messages, clock script naming). The look stays the same. On start (`page.go`):
+
+- `PAGE_FILE` exists and parses (and renders for every state): it is used as is.
+- It exists but is broken: an error is logged, the generated page is served from memory, the file is left untouched.
+- It is missing: the generated page is written atomically (temp file + rename, mode 0644) and used. If the directory is not writable, a warning is logged and the page is served from memory.
+
+Template data: `AppName`, `Description`, `Keywords`, `BaseURL`, `JSONLD`, `Nonce`, `Time`, `UnixMilli`, `OffsetSec`, `Year`, `HideForm`, `State` (`""`, `"invalid"` for 401, `"throttled"` for 429; the message texts live in the template).
 
 ## Endpoints
 

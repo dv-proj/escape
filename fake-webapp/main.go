@@ -28,7 +28,11 @@ func main() {
 		slog.Error("invalid config", "err", err)
 		os.Exit(1)
 	}
-	app := NewApp(cfg, time.Now)
+	app, err := NewApp(cfg, time.Now)
+	if err != nil {
+		slog.Error("page", "err", err)
+		os.Exit(1)
+	}
 
 	var protos http.Protocols
 	protos.SetHTTP1(true)
