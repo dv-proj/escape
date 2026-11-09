@@ -69,7 +69,8 @@ load_env() {
 
     # Defaults mirrored from docker-compose.yml.
     : "${PANEL_PORT:=2053}" "${SUB_PORT:=2096}" "${XHTTP_PORT:=10000}" "${NGINX_TLS_PORT:=8443}"
-    : "${XHTTP_ROUTE_PORT_MIN:=10000}" "${XHTTP_ROUTE_PORT_MAX:=19999}"
+    # Not ${VAR:=...}: the "}" of "{4}" would end the expansion.
+    [[ -n "${XHTTP_ROUTE_PORT_RE:-}" ]] || XHTTP_ROUTE_PORT_RE='1[0-9]{4}'
     : "${DATA_DIR:=./data}" "${ACME_SERVER:=letsencrypt}"
     : "${XUI_IMAGE:=ghcr.io/mhsanaei/3x-ui:v3.11.0}"
     : "${NGINX_IMAGE:=nginx:1.31.8-alpine}"

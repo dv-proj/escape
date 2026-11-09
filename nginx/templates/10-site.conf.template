@@ -68,10 +68,10 @@ server {
     }
 
     # Additional XHTTP inbounds created in the panel: path
-    # /${XHTTP_PATH}-<port>/ goes to xui:<port> for every port in
-    # XHTTP_ROUTE_PORT_MIN..XHTTP_ROUTE_PORT_MAX (regex built by
-    # docker-entrypoint.d/15-xhttp-route.envsh). The range never contains the
-    # panel, subscription or nginx ports. New inbounds need no nginx change.
+    # /${XHTTP_PATH}-<port>/ goes to xui:<port> for every port matching
+    # XHTTP_ROUTE_PORT_RE (checked by docker-entrypoint.d/15-xhttp-route.envsh:
+    # never the panel, subscription or nginx ports). New inbounds need no
+    # nginx change.
     location ~ "^/${XHTTP_PATH_RE}-(?<xhttp_route_port>${XHTTP_ROUTE_PORT_RE})/" {
         include /etc/nginx/conf.d/xhttp-proxy.inc;
         grpc_pass grpc://xui:$xhttp_route_port;

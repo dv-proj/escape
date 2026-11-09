@@ -28,7 +28,7 @@ Commands:
                    the inbound's internal port/security. Matches hosts by
                    remark; changes nothing when they are already right.
                    Also adds h2/h3 hosts to additional XHTTP inbounds
-                   (port in XHTTP_ROUTE_PORT_MIN..MAX, path
+                   (port matching XHTTP_ROUTE_PORT_RE, path
                    /XHTTP_PATH-<port>/, security none) that have no host
                    yet; their existing hosts are never changed. Idempotent.
   configure-sub    Apply the subscription settings through the panel API
@@ -52,7 +52,7 @@ Environment (.env at the repo root, or ENV_FILE=path):
                    REALITY_SHORT_ID XHTTP_PATH [XHTTP_PORT=10000]
                    [NGINX_TLS_PORT=8443] [PANEL_PORT=2053]
   configure-hosts  DOMAIN XHTTP_PATH [PANEL_PORT=2053] [PANEL_PATH]
-                   [XHTTP_ROUTE_PORT_MIN=10000] [XHTTP_ROUTE_PORT_MAX=19999]
+                   [XHTTP_ROUTE_PORT_RE=1[0-9]{4}]
   configure-sub    DOMAIN SUB_PATH [SUB_PORT=2096] [PANEL_PORT=2053] [PANEL_PATH]
   sub-links        DOMAIN SUB_PATH [PANEL_PORT=2053] [PANEL_PATH]
   links            DOMAIN CLIENT_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID
@@ -99,14 +99,21 @@ validate_common() {
     validate XHTTP_PORT '^[0-9]{1,5}$' "a port number"
     validate SUB_PORT '^[0-9]{1,5}$' "a port number"
     validate NGINX_TLS_PORT '^[0-9]{1,5}$' "a port number"
-    validate XHTTP_ROUTE_PORT_MIN '^[0-9]{1,5}$' "a port number"
-    validate XHTTP_ROUTE_PORT_MAX '^[0-9]{1,5}$' "a port number"
-    ((XHTTP_ROUTE_PORT_MIN >= 1024 && XHTTP_ROUTE_PORT_MIN <= XHTTP_ROUTE_PORT_MAX && XHTTP_ROUTE_PORT_MAX <= 65535)) ||
-        die "need 1024 <= XHTTP_ROUTE_PORT_MIN <= XHTTP_ROUTE_PORT_MAX <= 65535"
-    local p
+    validate_route_port_re
+}
+
+# Same checks as nginx/docker-entrypoint.d/15-xhttp-route.envsh (nginx refuses
+# to start otherwise).
+validate_route_port_re() {
+    local re="$XHTTP_ROUTE_PORT_RE" ports p
+    validate XHTTP_ROUTE_PORT_RE '^[][0-9{},|()?-]+$' "a port regex of 0-9 [ ] - { } , | ( ) ? (e.g. 1[0-9]{4})"
+    ports="$(seq 0 99999 | grep -Ex -- "$re")" || die "XHTTP_ROUTE_PORT_RE '$re' matches no port"
+    # seq output is sorted: the first and last matches are the extremes.
+    for p in "${ports%%$'\n'*}" "${ports##*$'\n'}"; do
+        ((10#$p >= 1024 && 10#$p <= 65535)) || die "XHTTP_ROUTE_PORT_RE matches $p: only ports 1024-65535 are allowed"
+    done
     for p in "$PANEL_PORT" "$SUB_PORT" "$NGINX_TLS_PORT"; do
-        ((p < XHTTP_ROUTE_PORT_MIN || p > XHTTP_ROUTE_PORT_MAX)) ||
-            die "port $p (PANEL_PORT/SUB_PORT/NGINX_TLS_PORT) is inside XHTTP_ROUTE_PORT_MIN..MAX"
+        ! grep -Eqx -- "$re" <<<"$p" || die "XHTTP_ROUTE_PORT_RE matches port $p (PANEL_PORT/SUB_PORT/NGINX_TLS_PORT)"
     done
 }
 
@@ -345,15 +352,16 @@ cmd_provision() {
 # Existing groups (matched by remark + inbound) are merged, so fields not
 # managed here (sort order, tags, ...) survive an update.
 # Additional XHTTP inbounds (created in the panel, port in
-# XHTTP_ROUTE_PORT_MIN..MAX, path /<XHTTP_PATH>-<port>/, security none) get
+# XHTTP_ROUTE_PORT_RE, path /<XHTTP_PATH>-<port>/, security none) get
 # h2 and h3 hosts too, but only while they have no host at all: once a host
 # exists for such an inbound it is left to the user.
 # argv: DOMAIN REALITY_INBOUND XHTTP_INBOUND REALITY_HOST H2_HOST H3_HOST
-#       XHTTP_PATH PORT_MIN PORT_MAX
+#       XHTTP_PATH PORT_RE
 HOSTS_PLAN_PY='
 import json, sys
 domain, in_reality, in_xhttp, host_reality, host_h2, host_h3, xhttp_path = sys.argv[1:8]
-port_min, port_max = int(sys.argv[8]), int(sys.argv[9])
+import re
+port_re = re.compile("(?:%s)" % sys.argv[8])
 inbounds = json.loads(sys.stdin.readline()).get("obj") or []
 groups = json.loads(sys.stdin.readline()).get("obj") or []
 ids = {i["remark"]: i["id"] for i in inbounds}
@@ -391,7 +399,7 @@ for inb in inbounds:
     if inb["id"] in managed or st.get("network") != "xhttp":
         continue
     port = int(inb.get("port") or 0)
-    if not port_min <= port <= port_max:
+    if not port_re.fullmatch(str(port)):
         continue
     name = inb.get("remark") or "#%d" % inb["id"]
     path = ((st.get("xhttpSettings") or {}).get("path") or "").rstrip("/")
@@ -437,7 +445,7 @@ apply_hosts() {
     plan="$(printf '%s\n%s\n' "$inbounds" "$hosts" |
         xui_exec python3 -I -c "$HOSTS_PLAN_PY" "$DOMAIN" "$REALITY_REMARK" "$XHTTP_REMARK" \
             "$REALITY_HOST_REMARK" "$XHTTP_H2_HOST_REMARK" "$XHTTP_H3_HOST_REMARK" \
-            "$XHTTP_PATH" "$XHTTP_ROUTE_PORT_MIN" "$XHTTP_ROUTE_PORT_MAX")" ||
+            "$XHTTP_PATH" "$XHTTP_ROUTE_PORT_RE")" ||
         die "could not compute the host changes"
     while IFS=$'\t' read -r action a b; do
         [[ -n "$action" ]] || continue
