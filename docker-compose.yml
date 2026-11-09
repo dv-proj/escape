@@ -9,6 +9,7 @@
 #   TCP 80  -> nginx (ACME HTTP-01 challenge + redirect to https).
 #   nginx routes /${XHTTP_PATH}/ -> xui:${XHTTP_PORT} (XHTTP, h2c),
 #                /${PANEL_PATH}/ -> xui:${PANEL_PORT} (3X-UI panel),
+#                /${SUB_PATH}/   -> xui:${SUB_PORT} (3X-UI subscription server),
 #                everything else -> fakeapp:8080 (decoy web application).
 #
 # All values come from .env (see .env.example). Bootstrap order is handled by
@@ -78,6 +79,8 @@ services:
       DOMAIN: ${DOMAIN:?DOMAIN is required}
       PANEL_PATH: ${PANEL_PATH:?PANEL_PATH is required}
       PANEL_PORT: ${PANEL_PORT:-2053}
+      SUB_PATH: ${SUB_PATH:?SUB_PATH is required}
+      SUB_PORT: ${SUB_PORT:-2096}
       XHTTP_PATH: ${XHTTP_PATH:?XHTTP_PATH is required}
       XHTTP_PORT: ${XHTTP_PORT:-10000}
       NGINX_TLS_PORT: ${NGINX_TLS_PORT:-8443}
@@ -88,7 +91,7 @@ services:
       NGINX_ALTSVC_MAX_AGE: ${NGINX_ALTSVC_MAX_AGE:-86400}
       # Only these variables are substituted into /etc/nginx/templates/*;
       # nginx's own $variables are left untouched.
-      NGINX_ENVSUBST_FILTER: "^(DOMAIN|PANEL_PATH|PANEL_PORT|XHTTP_PATH|XHTTP_PORT|NGINX_TLS_PORT|DOCKER_SUBNET|NGINX_CLIENT_HEADER_TIMEOUT|NGINX_KEEPALIVE_TIMEOUT|NGINX_HSTS_MAX_AGE|NGINX_ALTSVC_MAX_AGE)$$"
+      NGINX_ENVSUBST_FILTER: "^(DOMAIN|PANEL_PATH|PANEL_PORT|SUB_PATH|SUB_PORT|XHTTP_PATH|XHTTP_PORT|NGINX_TLS_PORT|DOCKER_SUBNET|NGINX_CLIENT_HEADER_TIMEOUT|NGINX_KEEPALIVE_TIMEOUT|NGINX_HSTS_MAX_AGE|NGINX_ALTSVC_MAX_AGE)$$"
       # Certificate watcher (nginx/docker-entrypoint.d/40-cert-reload.sh).
       CERT_RELOAD_INTERVAL: "300"
     ports:

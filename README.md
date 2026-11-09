@@ -37,6 +37,7 @@
 nginx (8443/tcp и 443/udp) маршрутизирует по пути:
    /<XHTTP_PATH>/  -> xui:10000   (XHTTP, h2c, grpc_pass)
    /<PANEL_PATH>/  -> xui:2053    (панель 3X-UI)
+   /<SUB_PATH>/    -> xui:2096    (сервер подписок 3X-UI)
    всё остальное   -> fakeapp:8080 (сайт-обманка)
 ```
 
@@ -77,7 +78,7 @@ sudo ./vpn.sh deploy
 
 1. Ставит пакеты, создает пользователя `vpn` (по умолчанию), включает lingering, настраивает sysctl `net.ipv4.ip_unprivileged_port_start=80` (`/etc/sysctl.d/99-vpn-rootless.conf`), ставит rootless Docker.
 2. Копирует проект в `~vpn/vpn-stack` (`VPN_DIR`).
-3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` (по умолчанию предлагается случайный правдоподобный набор, Enter принимает его), `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, `PAGE_SEED`, `RATE_LIMIT_*`, `LOGIN_DELAY_*`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
+3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` (по умолчанию предлагается случайный правдоподобный набор, Enter принимает его), `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `SUB_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, `PAGE_SEED`, `RATE_LIMIT_*`, `LOGIN_DELAY_*`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
 4. Создает временный самоподписанный сертификат, запускает стек и выпускает сертификат Let's Encrypt.
 5. Настраивает панель и создает входы `reality` и `xhttp`.
 
@@ -130,7 +131,10 @@ scripts/certs.sh issue       # выпуск (идемпотентно)
 scripts/certs.sh renew       # принудительное продление
 scripts/xui.sh links         # ссылки клиентов
 scripts/xui.sh configure-panel   # логин/пароль/порт/путь панели из .env
-scripts/xui.sh provision     # создать входы reality и xhttp, если их нет
+scripts/xui.sh provision     # создать входы reality и xhttp, если их нет (и хосты ссылок)
+scripts/xui.sh configure-hosts   # хосты 3X-UI: ссылки панели/подписок на DOMAIN:443 (идемпотентно)
+scripts/xui.sh configure-sub     # настройки подписок в панели из .env (идемпотентно)
+scripts/xui.sh sub-links     # URL подписок всех клиентов
 scripts/xui.sh genkeys       # напечатать новые ключи (ничего не записывает)
 ```
 
@@ -162,6 +166,8 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `PANEL_USERNAME` | вручную/`admin` | Логин панели |
 | `PANEL_PASSWORD` | сгенерировано | Пароль панели |
 | `PANEL_PORT` | по умолчанию | `2053` (внутри сети) |
+| `SUB_PATH` | сгенерировано | Секретный путь подписок (`https://DOMAIN/SUB_PATH/<subId>`); отличается от `PANEL_PATH` и `XHTTP_PATH` |
+| `SUB_PORT` | по умолчанию | `2096` (порт сервера подписок 3X-UI внутри сети, наружу не публикуется) |
 | `XHTTP_PATH` | сгенерировано | Секретный путь XHTTP |
 | `XHTTP_PORT` | по умолчанию | `10000` (внутри сети) |
 | `NGINX_TLS_PORT` | по умолчанию | `8443` (цель REALITY, внутри сети) |
@@ -176,6 +182,7 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 
 - Данные сайта-обманки (`APP_*`, `TZ`) и пути/порты nginx: `vpn.sh restart` (контейнеры пересоздаются по `docker compose up`).
 - Логин, пароль или путь панели: `scripts/xui.sh configure-panel` (он сам перезапускает xui), затем `vpn.sh restart`, чтобы nginx получил новый `PANEL_PATH`.
+- `SUB_PATH`, `SUB_PORT`: `scripts/xui.sh configure-sub` (применяет настройки в панели и перезапускает xui, если что-то изменилось), затем `vpn.sh restart`, чтобы nginx получил новые значения.
 - `XHTTP_PATH`: исправьте путь во входе `xhttp` в панели и перезапустите стек. Клиентам нужны новые ссылки.
 - `REALITY_MAX_TIME_DIFF_MS`: используется только при создании входа `reality`. В существующих установках откройте вход `reality` в панели и задайте «Max Time Diff (ms)» (значение из `.env`) либо удалите входы и запустите `scripts/xui.sh provision`. Автоматической миграции нет. При обновлении `vpn.sh` дописывает недостающие ключи в `.env` сам.
 - Ключи REALITY, `REALITY_SHORT_ID`, `CLIENT_UUID`: `provision` не меняет существующие входы (создает их, только если нет входов с такими именами). Обновите значения в панели вручную или удалите входы `reality`/`xhttp` и запустите `scripts/xui.sh provision`. Клиенты должны получить новые ссылки (`vpn.sh links`).
@@ -284,14 +291,32 @@ vless://UUID@DOMAIN:443?encryption=none&security=tls&sni=DOMAIN&alpn=h3&fp=chrom
 
 Импорт: скопируйте `vless://` из `./vpn.sh links` и вставьте из буфера обмена в клиент. QR-код можно получить в панели (кнопка у клиента во входе).
 
+### Подписки
+
+Подписка отдает клиентскому приложению сразу все ссылки пользователя (REALITY, XHTTP h2, XHTTP h3) одним адресом, и приложение обновляет их само:
+
+```
+https://DOMAIN/SUB_PATH/<subId>
+```
+
+`./vpn.sh links` (или `scripts/xui.sh sub-links`) печатает URL подписки каждого клиента. В приложении добавьте его как подписку (v2rayNG, Hiddify, Streisand, v2rayN и др.). `subId` задается у клиента в панели (поле «Subscription»); при создании входов `deploy` дает обоим стартовым клиентам один `subId`, поэтому у них один URL с тремя ссылками. В установках, созданных до появления подписок, у стартовых клиентов разные `subId` (будет два URL): чтобы получить один, задайте обоим клиентам в панели одинаковый `subId`.
+
+Как это устроено:
+
+- Сервер подписок 3X-UI слушает `SUB_PORT` внутри контейнера `xui` (наружу не публикуется), nginx проксирует `https://DOMAIN/SUB_PATH/` на него без изменения пути и не пишет такие запросы в access-лог (в URL лежит секретный `subId`). TLS терминирует nginx.
+- `scripts/xui.sh configure-sub` (вызывается из `deploy`) через API панели задает `subEnable`, `subPort`, `subPath=/SUB_PATH/`, `subDomain=DOMAIN`, `subURI=https://DOMAIN/SUB_PATH/` и отключает TLS самого сервера подписок. Повторный запуск ничего не меняет, если настройки уже верны. Шаблон названий ссылок дополняется токеном `{{HOST}}` (чтобы ссылки h2 и h3 различались), только если он остался заводским.
+- Хосты 3X-UI (`scripts/xui.sh configure-hosts`, вызывается из `provision`): без них панель и подписки строят ссылки из самого входа, то есть для `xhttp` с внутренним портом 10000 и `security=none` (TLS на деле терминирует nginx на 443), и такие ссылки не работают. Хосты `h2` и `h3` входа `xhttp` задают `DOMAIN:443`, TLS, SNI и Host `DOMAIN`, `alpn` `h2`/`h3`, fingerprint `chrome`; хост `tcp` входа `reality` задает `DOMAIN:443` с сохранением параметров REALITY. Пока у входа есть хосты, его собственная ссылка заменяется ссылками хостов (не дублируется). Поэтому ссылки и QR из панели теперь совпадают с `scripts/xui.sh links`. Хосты можно править в панели (раздел Hosts): скрипт сравнивает только свои поля.
+- Клиентам, созданным вручную, задайте тот же `subId`, чтобы объединить их ссылки в одну подписку.
+
 ### Дополнительные пользователи
 
-В панели 3X-UI откройте вход `reality` и `xhttp`, добавьте клиентов. Электронная почта (email) клиента должна быть уникальной в пределах панели, один и тот же человек может иметь по клиенту на каждом входе с разными email. Ссылки и QR берутся из панели. Для REALITY-клиентам задайте Flow `xtls-rprx-vision`.
+В панели 3X-UI откройте вход `reality` и `xhttp`, добавьте клиентов. Электронная почта (email) клиента должна быть уникальной в пределах панели, один и тот же человек может иметь по клиенту на каждом входе с разными email. Ссылки и QR берутся из панели. Для REALITY-клиентам задайте Flow `xtls-rprx-vision`. Чтобы у человека была одна подписка со всеми ссылками, задайте клиентам на обоих входах одинаковый `subId` (его URL: `https://DOMAIN/SUB_PATH/<subId>`).
 
 ## 8. Панель 3X-UI
 
 - URL: `https://DOMAIN/PANEL_PATH/`.
 - Логин и пароль: `PANEL_USERNAME` / `PANEL_PASSWORD` в `.env`; также выводятся `vpn.sh links`.
+- Подписки и хосты (ссылки с `DOMAIN:443`) настраиваются скриптом, см. раздел «Подписки»; не отключайте хосты `h2`/`h3`/`tcp`, иначе ссылки панели снова получат внутренний порт. Если подписки не открываются: `scripts/xui.sh configure-sub`.
 - Не меняйте порты и target входов без необходимости: порты 10000 и 8443 связаны с настройкой nginx, а target REALITY должен указывать на `nginx:8443` с `xver=1`.
 - Не публикуйте адрес панели и не передавайте путь третьим лицам.
 

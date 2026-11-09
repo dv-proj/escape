@@ -20,8 +20,21 @@ Commands:
                    wait for the panel. Idempotent.
   provision        Create the 'reality' and 'xhttp' inbounds via the 3X-UI HTTP
                    API unless inbounds with these remarks already exist, then
-                   restart Xray. Requires a running xui container (run
-                   configure-panel first). Idempotent.
+                   restart Xray, then run configure-hosts. Requires a running
+                   xui container (run configure-panel first). Idempotent.
+  configure-hosts  Create/update the 3X-UI "hosts" (per-inbound link overrides)
+                   so that panel and subscription links point to
+                   DOMAIN:443 with TLS (xhttp: h2 and h3 variants) instead of
+                   the inbound's internal port/security. Matches hosts by
+                   remark; changes nothing when they are already right.
+                   Idempotent.
+  configure-sub    Apply the subscription settings through the panel API
+                   (enabled, port SUB_PORT, path /SUB_PATH/, public URL
+                   https://DOMAIN/SUB_PATH/, no TLS on the sub server: nginx
+                   terminates it) and restart xui only if something changed.
+                   Idempotent.
+  sub-links        Print the subscription URL of every client (one per line):
+                   https://DOMAIN/SUB_PATH/<subId>. Requires a running panel.
   links            Print client share links (stdout, one per line):
                    1) VLESS+REALITY+Vision (TCP 443)
                    2) VLESS+XHTTP over TLS/h2 (TCP 443 -> REALITY fallback ->
@@ -35,6 +48,9 @@ Environment (.env at the repo root, or ENV_FILE=path):
   provision        DOMAIN CLIENT_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
                    REALITY_SHORT_ID XHTTP_PATH [XHTTP_PORT=10000]
                    [NGINX_TLS_PORT=8443] [PANEL_PORT=2053]
+  configure-hosts  DOMAIN [PANEL_PORT=2053] [PANEL_PATH]
+  configure-sub    DOMAIN SUB_PATH [SUB_PORT=2096] [PANEL_PORT=2053] [PANEL_PATH]
+  sub-links        DOMAIN SUB_PATH [PANEL_PORT=2053] [PANEL_PATH]
   links            DOMAIN CLIENT_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID
                    XHTTP_PATH [LINK_NAME, default: APP_NAME or "vpn"]
   genkeys          [XUI_IMAGE]
@@ -43,6 +59,16 @@ EOF
 
 REALITY_REMARK=reality
 XHTTP_REMARK=xhttp
+# Host (link override) remarks. A subscription link is named
+# "<inbound remark>-<host remark>-<client email>".
+# The panel's factory remark template has no {{HOST}}, so the h2 and h3 xhttp
+# links would get the same name. configure-sub adds {{HOST}} to it, but only
+# while the template still is the factory one (a customised one is kept).
+FACTORY_REMARK_TEMPLATE='{{INBOUND}}-{{EMAIL}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D'
+LINK_REMARK_TEMPLATE='{{INBOUND}}-{{HOST}}-{{EMAIL}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D'
+REALITY_HOST_REMARK=tcp
+XHTTP_H2_HOST_REMARK=h2
+XHTTP_H3_HOST_REMARK=h3
 # Token name used for API access during provisioning; rotated (invalidated)
 # again when provisioning finishes.
 API_TOKEN_NAME=vpn-provision
@@ -63,9 +89,11 @@ validate_common() {
     [[ -z "${REALITY_SHORT_ID:-}" ]] || validate REALITY_SHORT_ID '^([0-9a-f]{2}){1,8}$' "1-8 bytes of lowercase hex (2-16 chars)"
     [[ -z "${XHTTP_PATH:-}" ]] || validate XHTTP_PATH '^[A-Za-z0-9._~-]+$' "a single URL path segment without slashes"
     [[ -z "${PANEL_PATH:-}" ]] || validate PANEL_PATH '^[A-Za-z0-9._~-]+$' "a single URL path segment without slashes"
+    [[ -z "${SUB_PATH:-}" ]] || validate SUB_PATH '^[A-Za-z0-9._~-]+$' "a single URL path segment without slashes"
     [[ -z "${REALITY_MAX_TIME_DIFF_MS:-}" ]] || validate REALITY_MAX_TIME_DIFF_MS '^[0-9]{1,9}$' "a non-negative integer in milliseconds (0 disables the check)"
     validate PANEL_PORT '^[0-9]{1,5}$' "a port number"
     validate XHTTP_PORT '^[0-9]{1,5}$' "a port number"
+    validate SUB_PORT '^[0-9]{1,5}$' "a port number"
     validate NGINX_TLS_PORT '^[0-9]{1,5}$' "a port number"
 }
 
@@ -104,16 +132,19 @@ xui_exec() {
     compose exec -T xui "$@"
 }
 
-wait_panel() {
-    local i
+# wait_port PORT WHAT: wait until xui listens on PORT (inside the container).
+wait_port() {
+    local port="$1" what="$2" i
     for ((i = 0; i < 60; i++)); do
-        if xui_exec nc -z 127.0.0.1 "$PANEL_PORT" >/dev/null 2>&1; then
+        if xui_exec nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
     done
-    die "panel did not start listening on port $PANEL_PORT within 120s; see: docker compose logs xui"
+    die "$what did not start listening on port $port within 120s; see: docker compose logs xui"
 }
+
+wait_panel() { wait_port "$PANEL_PORT" "panel"; }
 
 # --- genkeys -------------------------------------------------------------------------
 
@@ -159,6 +190,7 @@ cmd_configure_panel() {
 
 API_TOKEN=""
 API_BASE=""
+PROVISION_SUB_ID=""
 
 issue_token() {
     xui_exec /app/x-ui setting -getApiToken -tokenName "$API_TOKEN_NAME" -tokenScope admin 2>/dev/null |
@@ -198,7 +230,7 @@ has_remark() { # LIST_RESPONSE REMARK
 
 client_json() { # EMAIL FLOW
     printf '{"id":%s,"flow":%s,"email":%s,"limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":%s,"comment":"","reset":0}' \
-        "$(json_str "$CLIENT_UUID")" "$(json_str "$2")" "$(json_str "$1")" "$(json_str "$(random_hex 8)")"
+        "$(json_str "$CLIENT_UUID")" "$(json_str "$2")" "$(json_str "$1")" "$(json_str "${PROVISION_SUB_ID:-$(random_hex 8)}")"
 }
 
 SNIFFING='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
@@ -236,8 +268,10 @@ add_inbound() { # REMARK JSON
     log "inbound '$1' created"
 }
 
-cmd_provision() {
-    require_vars DOMAIN CLIENT_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID XHTTP_PATH
+# api_session_start: wait for the panel, find its base path, obtain a token
+# (revoked again on exit). No-op when a session is already open.
+api_session_start() {
+    [[ -z "$API_TOKEN" ]] || return 0
     require_running xui
     wait_panel
 
@@ -251,6 +285,14 @@ cmd_provision() {
     API_TOKEN="$(issue_token)"
     [[ -n "$API_TOKEN" ]] || die "could not obtain an API token from 'x-ui setting -getApiToken'"
     trap revoke_token EXIT
+}
+
+cmd_provision() {
+    require_vars DOMAIN CLIENT_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID XHTTP_PATH
+    api_session_start
+    # Both new clients share one subscription id: a single subscription URL
+    # then carries the REALITY link and both XHTTP links.
+    PROVISION_SUB_ID="$(random_hex 8)"
 
     local list changed=0
     list="$(api GET inbounds/list)" || die "API request inbounds/list failed"
@@ -275,6 +317,174 @@ cmd_provision() {
         api_ok "$resp" || die "failed to restart Xray: $(api_msg "$resp")"
         log "Xray restarted"
     fi
+
+    apply_hosts
+}
+
+# --- hosts (link overrides) -------------------------------------------------------
+
+# 3X-UI builds panel and subscription links from the inbound itself (internal
+# port, security "none" for xhttp, server address). A "host" overrides that per
+# inbound: with at least one enabled host the inbound's own link is replaced by
+# one link per host. Reads two JSON lines on stdin (inbounds/list and
+# hosts/list responses), prints the changes needed, one per line:
+#   add<TAB><HostGroup JSON>   |   update<TAB><groupId><TAB><HostGroup JSON>
+# Existing groups (matched by remark + inbound) are merged, so fields not
+# managed here (sort order, tags, ...) survive an update.
+# argv: DOMAIN REALITY_INBOUND XHTTP_INBOUND REALITY_HOST H2_HOST H3_HOST
+HOSTS_PLAN_PY='
+import json, sys
+domain, in_reality, in_xhttp, host_reality, host_h2, host_h3 = sys.argv[1:7]
+inbounds = json.loads(sys.stdin.readline()).get("obj") or []
+groups = json.loads(sys.stdin.readline()).get("obj") or []
+ids = {i["remark"]: i["id"] for i in inbounds}
+
+def want(inbound, remark, security, sni, header, alpn, fp):
+    return {"inboundIds": [ids[inbound]], "hosts": [domain], "remark": remark,
+            "port": 443, "security": security, "sni": sni, "hostHeader": header,
+            "alpn": alpn, "fingerprint": fp, "isDisabled": False}
+
+desired = []
+if in_reality in ids:
+    desired.append(want(in_reality, host_reality, "same", "", "", [], ""))
+else:
+    sys.stderr.write("inbound %r not found; skipping its host\n" % in_reality)
+if in_xhttp in ids:
+    desired.append(want(in_xhttp, host_h2, "tls", domain, domain, ["h2"], "chrome"))
+    desired.append(want(in_xhttp, host_h3, "tls", domain, domain, ["h3"], "chrome"))
+else:
+    sys.stderr.write("inbound %r not found; skipping its hosts\n" % in_xhttp)
+
+def same(group, w):
+    for k, v in w.items():
+        if k == "hosts":
+            v = ["%s:%d" % (domain, w["port"])]
+        cur = group.get(k)
+        if cur is None:
+            cur = [] if isinstance(v, list) else ("" if isinstance(v, str) else cur)
+        if cur != v:
+            return False
+    return True
+
+for w in desired:
+    found = [g for g in groups if g.get("remark") == w["remark"] and w["inboundIds"][0] in (g.get("inboundIds") or [])]
+    if not found:
+        print("add\t" + json.dumps(w, separators=(",", ":")))
+    elif not same(found[0], w):
+        merged = dict(found[0]); merged.update(w)
+        print("update\t%s\t%s" % (found[0]["groupId"], json.dumps(merged, separators=(",", ":"))))
+'
+
+# apply_hosts: needs an open API session. Safe to repeat.
+apply_hosts() {
+    local inbounds hosts plan action a b resp n=0
+    inbounds="$(api GET inbounds/list)" || die "API request inbounds/list failed"
+    api_ok "$inbounds" || die "inbounds/list failed: $(api_msg "$inbounds")"
+    hosts="$(api GET hosts/list)" || die "API request hosts/list failed"
+    api_ok "$hosts" || die "hosts/list failed: $(api_msg "$hosts") (response: ${hosts:0:200})"
+    plan="$(printf '%s\n%s\n' "$inbounds" "$hosts" |
+        xui_exec python3 -I -c "$HOSTS_PLAN_PY" "$DOMAIN" "$REALITY_REMARK" "$XHTTP_REMARK" \
+            "$REALITY_HOST_REMARK" "$XHTTP_H2_HOST_REMARK" "$XHTTP_H3_HOST_REMARK")" ||
+        die "could not compute the host changes"
+    while IFS=$'\t' read -r action a b; do
+        [[ -n "$action" ]] || continue
+        case "$action" in
+            add) resp="$(api POST hosts/add "$a")" || die "API request hosts/add failed" ;;
+            update) resp="$(api POST "hosts/update/$a" "$b")" || die "API request hosts/update failed" ;;
+            *) die "unexpected host plan line: $action" ;;
+        esac
+        api_ok "$resp" || die "host $action failed: $(api_msg "$resp") (response: ${resp:0:200})"
+        n=$((n + 1))
+    done <<<"$plan"
+    if ((n)); then log "hosts configured ($n changed)"; else log "hosts already up to date"; fi
+}
+
+cmd_configure_hosts() {
+    require_vars DOMAIN
+    api_session_start
+    apply_hosts
+}
+
+# --- subscriptions ------------------------------------------------------------------
+
+# Reads the setting/all response on stdin. argv items:
+#   KEY=<JSON value>                  set KEY
+#   ?KEY<TAB><JSON old><TAB><JSON new>  set KEY to new only if it currently is old
+# Prints the full settings body to post when any key differs (the differences
+# go to stderr), nothing otherwise.
+SETTINGS_PATCH_PY='
+import json, sys
+resp = json.loads(sys.stdin.readline())
+obj = resp.get("obj")
+if not resp.get("success") or not isinstance(obj, dict):
+    sys.exit("setting/all failed: %s" % resp.get("msg"))
+changed = False
+for item in sys.argv[1:]:
+    if item.startswith("?"):
+        key, old, raw = item[1:].split("\t")
+        if key not in obj:
+            sys.exit("unknown setting key: %s" % key)
+        if obj[key] != json.loads(old):
+            continue
+    else:
+        key, raw = item.split("=", 1)
+    val = json.loads(raw)
+    if key not in obj:
+        sys.exit("unknown setting key: %s" % key)
+    if obj[key] != val:
+        sys.stderr.write("  %s: %s -> %s\n" % (key, json.dumps(obj[key]), json.dumps(val)))
+        obj[key] = val
+        changed = True
+if changed:
+    print(json.dumps(obj, separators=(",", ":")))
+'
+
+cmd_configure_sub() {
+    require_vars DOMAIN SUB_PATH
+    [[ "$SUB_PATH" != "${PANEL_PATH:-}" && "$SUB_PATH" != "${XHTTP_PATH:-}" ]] ||
+        die "SUB_PATH must differ from PANEL_PATH and XHTTP_PATH"
+    api_session_start
+
+    local resp body domain="${DOMAIN,,}"
+    resp="$(api POST setting/all)" || die "API request setting/all failed"
+    api_ok "$resp" || die "setting/all failed: $(api_msg "$resp") (response: ${resp:0:200})"
+    # The sub server speaks plain HTTP on all addresses of the container;
+    # nginx publishes it at https://DOMAIN/SUB_PATH/ (path passed unchanged).
+    log "checking subscription settings (port $SUB_PORT, path /$SUB_PATH/)"
+    body="$(printf '%s\n' "$resp" | xui_exec python3 -I -c "$SETTINGS_PATCH_PY" \
+        'subEnable=true' 'subListen=""' "subPort=$SUB_PORT" \
+        "subPath=$(json_str "/$SUB_PATH/")" "subDomain=$(json_str "$domain")" \
+        "subURI=$(json_str "https://$domain/$SUB_PATH/")" \
+        'subCertFile=""' 'subKeyFile=""' \
+        "$(printf '?remarkTemplate\t%s\t%s' "$(json_str "$FACTORY_REMARK_TEMPLATE")" "$(json_str "$LINK_REMARK_TEMPLATE")")")" || die "could not prepare the subscription settings"
+    if [[ -z "$body" ]]; then
+        log "subscription settings already up to date"
+        return 0
+    fi
+    resp="$(api POST setting/update "$body")" || die "API request setting/update failed"
+    api_ok "$resp" || die "setting/update failed: $(api_msg "$resp") (response: ${resp:0:200})"
+    # The subscription server reads its settings at start.
+    log "restarting xui to apply the subscription settings"
+    compose restart xui >/dev/null 2>&1 || die "failed to restart xui; see: docker compose logs xui"
+    wait_panel
+    wait_port "$SUB_PORT" "subscription server"
+    log "subscriptions are served at https://$domain/$SUB_PATH/<subId>"
+}
+
+cmd_sub_links() {
+    require_vars DOMAIN SUB_PATH
+    api_session_start
+    local resp ids id
+    resp="$(api GET clients/list)" || die "API request clients/list failed"
+    api_ok "$resp" || die "clients/list failed: $(api_msg "$resp") (response: ${resp:0:200})"
+    ids="$(grep -o '"subId":[[:space:]]*"[^"]*"' <<<"$resp" | cut -d'"' -f4 | awk 'NF && !seen[$0]++')" || true
+    [[ -n "$ids" ]] || {
+        warn "no client with a subscription id found"
+        return 0
+    }
+    while IFS= read -r id; do
+        printf 'https://%s/%s/%s\n' "${DOMAIN,,}" "$SUB_PATH" "$id"
+    done <<<"$ids"
 }
 
 # --- links ------------------------------------------------------------------------------
@@ -310,7 +520,7 @@ main() {
             : "${XUI_IMAGE:=ghcr.io/mhsanaei/3x-ui:v3.11.0}"
             cmd_genkeys
             ;;
-        configure-panel | provision)
+        configure-panel | provision | configure-hosts | configure-sub | sub-links)
             need_cmd docker od
             load_env
             validate_common

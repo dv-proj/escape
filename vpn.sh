@@ -70,14 +70,14 @@ user. Target systems: Ubuntu 24.04+ and Debian 12+.
 Commands:
   deploy    Full idempotent setup (root): packages, rootless Docker for the VPN
             user, project copy, .env generation, certificates, stack start,
-            panel/inbound provisioning. Prints panel URL, credentials and client
-            links. Re-running updates files and restarts the stack without
+            panel/inbound provisioning, subscriptions. Prints panel URL,
+            credentials, client links and subscription URLs. Re-running updates files and restarts the stack without
             regenerating secrets.
   start     Start the stack (docker compose up -d --wait).
   stop      Stop the stack (docker compose stop).
   restart   Stop and start the stack.
   status    Show container and certificate status.
-  links     Print panel URL/credentials and client links.
+  links     Print panel URL/credentials, client links and subscription URLs.
   remove    Remove the containers and built images (root). With --purge also
             deletes all data (certs, panel DB), the rootless Docker install,
             the VPN user and the sysctl file. Packages are never removed.
@@ -416,6 +416,16 @@ gen_xhttp_path() {
     while [[ -z "$x" || "$x" == "$p" ]]; do x="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"; done
     printf '%s' "$x"
 }
+# gen_sub_path [ENVFILE]: differs from PANEL_PATH and XHTTP_PATH.
+gen_sub_path() {
+    local p="" x="" s=""
+    if [[ -n "${1:-}" ]]; then
+        p="$(env_get "$1" PANEL_PATH)"
+        x="$(env_get "$1" XHTTP_PATH)"
+    fi
+    while [[ -z "$s" || "$s" == "$p" || "$s" == "$x" ]]; do s="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"; done
+    printf '%s' "$s"
+}
 gen_panel_password() { rand_str 28 'A-Za-z0-9'; }
 
 # SYNC_SECRETS holds REALITY_* / CLIENT_UUID from one genkeys call (sync only).
@@ -481,6 +491,7 @@ generator_for() {
         REALITY_MAX_TIME_DIFF_MS) echo gen_reality_max_time_diff ;;
         PANEL_PATH) echo gen_panel_path ;;
         XHTTP_PATH) echo gen_xhttp_path ;;
+        SUB_PATH) echo gen_sub_path ;;
         PANEL_PASSWORD) echo gen_panel_password ;;
         TZ) echo gen_tz ;;
         REALITY_PRIVATE_KEY) echo gen_reality_private_key ;;
@@ -628,14 +639,19 @@ generate_env() {
     if [[ "$saved_tz" != __unset__ ]]; then export TZ="$saved_tz"; fi
 
     # Generated values.
-    local ppath xpath
+    local ppath xpath spath
     ppath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
     xpath="$ppath"
     while [[ "$xpath" == "$ppath" ]]; do
         xpath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
     done
+    spath="$ppath"
+    while [[ "$spath" == "$ppath" || "$spath" == "$xpath" ]]; do
+        spath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
+    done
     ENV_VALUES[PANEL_PATH]="$ppath"
     ENV_VALUES[XHTTP_PATH]="$xpath"
+    ENV_VALUES[SUB_PATH]="$spath"
     ENV_VALUES[PANEL_PASSWORD]="$(rand_str 28 'A-Za-z0-9')"
     ENV_VALUES[RANDOM_DATA_SUFFIX]="$(gen_random_data_suffix)"
     ENV_VALUES[PAGE_SEED]="$(gen_page_seed)"
@@ -1049,6 +1065,8 @@ print_summary() {
     printf 'Password  : %s\n' "$ppass"
     printf '\nClient links:\n'
     in_stack scripts/xui.sh links
+    printf '\nSubscription URLs (import into a client app; carry all links of a client):\n'
+    in_stack scripts/xui.sh sub-links || warn "subscription URLs unavailable (is the stack running?)"
 }
 
 # --- commands -----------------------------------------------------------------------------------------
@@ -1104,9 +1122,10 @@ cmd_deploy() {
     step "Building and starting the stack"
     in_stack docker compose up -d --build --wait
 
-    step "Configuring the panel, creating inbounds, issuing the certificate"
+    step "Configuring the panel, inbounds, subscriptions, issuing the certificate"
     in_stack scripts/xui.sh configure-panel
     in_stack scripts/xui.sh provision
+    in_stack scripts/xui.sh configure-sub
     in_stack scripts/certs.sh issue
 
     CURRENT_STEP="summary"

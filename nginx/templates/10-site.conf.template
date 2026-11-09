@@ -56,6 +56,7 @@ server {
 
     set $xhttp_upstream xui:${XHTTP_PORT};
     set $panel_upstream xui:${PANEL_PORT};
+    set $sub_upstream   xui:${SUB_PORT};
     set $app_upstream   fakeapp:8080;
 
     # VLESS + XHTTP. Xray's XHTTP inbound speaks h2c, so grpc_pass is used:
@@ -91,6 +92,22 @@ server {
         # WebSocket (panel live updates) needs a long read timeout.
         proxy_read_timeout 300s;
         proxy_pass http://$panel_upstream;
+    }
+
+    # 3X-UI subscription server (subPath = /${SUB_PATH}/, so the URI is passed
+    # through unchanged). The subscription ids in the URLs are secrets: no access log.
+    location /${SUB_PATH}/ {
+        access_log off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_pass http://$sub_upstream;
     }
 
     # Decoy web application.
