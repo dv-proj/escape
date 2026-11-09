@@ -60,6 +60,7 @@ func main() {
 				return
 			case <-t.C:
 				app.throttle.Cleanup()
+				app.ips.Cleanup()
 			}
 		}
 	}()
