@@ -1,0 +1,6 @@
+.git
+Dockerfile
+.dockerignore
+*_test.go
+README.md
+fake-webapp
