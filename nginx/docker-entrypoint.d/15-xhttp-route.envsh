@@ -1,0 +1,69 @@
+#!/bin/sh
+# Sourced by the nginx image entrypoint (*.envsh) before the templates are
+# rendered (20-envsubst-on-templates.sh). Turns the port range
+# XHTTP_ROUTE_PORT_MIN..XHTTP_ROUTE_PORT_MAX into a regular expression for
+# the "/<XHTTP_PATH>-<port>/" location (nginx cannot compare numbers) and
+# escapes XHTTP_PATH for use inside that regex. Exports:
+#   XHTTP_ROUTE_PORT_RE   e.g. 1[0-9]{4} for 10000..19999
+#   XHTTP_PATH_RE         XHTTP_PATH with regex metacharacters escaped
+
+xhttp_route_fail() {
+    echo "15-xhttp-route: $*" >&2
+    exit 1
+}
+
+: "${XHTTP_ROUTE_PORT_MIN:=10000}"
+: "${XHTTP_ROUTE_PORT_MAX:=19999}"
+
+case "$XHTTP_ROUTE_PORT_MIN$XHTTP_ROUTE_PORT_MAX" in
+    *[!0-9]*) xhttp_route_fail "XHTTP_ROUTE_PORT_MIN/MAX must be integers" ;;
+esac
+if [ "$XHTTP_ROUTE_PORT_MIN" -lt 1024 ] || [ "$XHTTP_ROUTE_PORT_MAX" -gt 65535 ] ||
+    [ "$XHTTP_ROUTE_PORT_MIN" -gt "$XHTTP_ROUTE_PORT_MAX" ]; then
+    xhttp_route_fail "need 1024 <= XHTTP_ROUTE_PORT_MIN <= XHTTP_ROUTE_PORT_MAX <= 65535"
+fi
+# The range must never reach the panel, the subscription server or nginx itself.
+for p in "${PANEL_PORT:-2053}" "${SUB_PORT:-2096}" "${NGINX_TLS_PORT:-8443}"; do
+    if [ "$p" -ge "$XHTTP_ROUTE_PORT_MIN" ] && [ "$p" -le "$XHTTP_ROUTE_PORT_MAX" ]; then
+        xhttp_route_fail "port $p (panel/subscriptions/nginx) is inside XHTTP_ROUTE_PORT_MIN..MAX"
+    fi
+done
+
+# Split [lo, hi] into aligned blocks "prefix + k free digits" and merge
+# neighbouring blocks into digit classes: 10000..19999 -> 1[0-9]{4}.
+XHTTP_ROUTE_PORT_RE="$(awk -v lo="$XHTTP_ROUTE_PORT_MIN" -v hi="$XHTTP_ROUTE_PORT_MAX" '
+function pow10(k,  r) { r = 1; while (k-- > 0) r *= 10; return r }
+function flush() {
+    if (n == "") return
+    s = stem (d1 == d2 ? d1 : "[" d1 "-" d2 "]")
+    if (gk == 1) s = s "[0-9]"; else if (gk > 1) s = s "[0-9]{" gk "}"
+    out = out (out == "" ? "" : "|") s
+    n = ""
+}
+BEGIN {
+    lo += 0; hi += 0; out = ""; n = ""
+    while (lo <= hi) {
+        k = 0
+        while (lo % pow10(k + 1) == 0 && lo + pow10(k + 1) - 1 <= hi) k++
+        str = sprintf("%d", lo)
+        head = substr(str, 1, length(str) - k)
+        st = substr(head, 1, length(head) - 1)
+        d = substr(head, length(head), 1)
+        if (n != "" && k == gk && st == stem && length(str) == glen && d == d2 + 1) {
+            d2 = d
+        } else {
+            flush()
+            n = 1; stem = st; gk = k; glen = length(str); d1 = d; d2 = d
+        }
+        lo += pow10(k)
+    }
+    flush()
+    print out
+}')" || xhttp_route_fail "could not build the port regex"
+[ -n "$XHTTP_ROUTE_PORT_RE" ] || xhttp_route_fail "empty port regex"
+
+XHTTP_PATH_RE="$(printf '%s' "${XHTTP_PATH:?XHTTP_PATH is required}" | sed 's/[.]/\\./g')"
+
+export XHTTP_ROUTE_PORT_RE XHTTP_PATH_RE
+unset -f xhttp_route_fail
+unset p

@@ -85,6 +85,9 @@ services:
       SUB_PORT: ${SUB_PORT:-2096}
       XHTTP_PATH: ${XHTTP_PATH:?XHTTP_PATH is required}
       XHTTP_PORT: ${XHTTP_PORT:-10000}
+      # Port range of additional XHTTP inbounds (/XHTTP_PATH-<port>/ -> xui:<port>).
+      XHTTP_ROUTE_PORT_MIN: ${XHTTP_ROUTE_PORT_MIN:-10000}
+      XHTTP_ROUTE_PORT_MAX: ${XHTTP_ROUTE_PORT_MAX:-19999}
       NGINX_TLS_PORT: ${NGINX_TLS_PORT:-8443}
       DOCKER_SUBNET: ${DOCKER_SUBNET:-172.30.53.0/24}
       NGINX_CLIENT_HEADER_TIMEOUT: ${NGINX_CLIENT_HEADER_TIMEOUT:-60}
@@ -93,7 +96,7 @@ services:
       NGINX_ALTSVC_MAX_AGE: ${NGINX_ALTSVC_MAX_AGE:-86400}
       # Only these variables are substituted into /etc/nginx/templates/*;
       # nginx's own $variables are left untouched.
-      NGINX_ENVSUBST_FILTER: "^(DOMAIN|PANEL_PATH|PANEL_PORT|SUB_PATH|SUB_PORT|XHTTP_PATH|XHTTP_PORT|NGINX_TLS_PORT|DOCKER_SUBNET|NGINX_CLIENT_HEADER_TIMEOUT|NGINX_KEEPALIVE_TIMEOUT|NGINX_HSTS_MAX_AGE|NGINX_ALTSVC_MAX_AGE)$$"
+      NGINX_ENVSUBST_FILTER: "^(DOMAIN|PANEL_PATH|PANEL_PORT|SUB_PATH|SUB_PORT|XHTTP_PATH|XHTTP_PATH_RE|XHTTP_ROUTE_PORT_RE|XHTTP_PORT|NGINX_TLS_PORT|DOCKER_SUBNET|NGINX_CLIENT_HEADER_TIMEOUT|NGINX_KEEPALIVE_TIMEOUT|NGINX_HSTS_MAX_AGE|NGINX_ALTSVC_MAX_AGE)$$"
       # Certificate watcher (nginx/docker-entrypoint.d/40-cert-reload.sh).
       CERT_RELOAD_INTERVAL: "300"
     ports:
@@ -101,6 +104,8 @@ services:
       - "443:443/udp"
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
+      # Builds XHTTP_ROUTE_PORT_RE / XHTTP_PATH_RE for the templates.
+      - ./nginx/docker-entrypoint.d/15-xhttp-route.envsh:/docker-entrypoint.d/15-xhttp-route.envsh:ro
       - ./nginx/docker-entrypoint.d/40-cert-reload.sh:/docker-entrypoint.d/40-cert-reload.sh:ro
       - ${DATA_DIR:-./data}/certs:/etc/nginx/certs:ro
       - ${DATA_DIR:-./data}/webroot:/var/www/acme:ro

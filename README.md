@@ -36,6 +36,7 @@
 
 nginx (8443/tcp и 443/udp) маршрутизирует по пути:
    /<XHTTP_PATH>/  -> xui:10000   (XHTTP, h2c, grpc_pass)
+   /<XHTTP_PATH>-<порт>/ -> xui:<порт>  (доп. входы XHTTP, порт 10000-19999)
    /<PANEL_PATH>/  -> xui:2053    (панель 3X-UI)
    /<SUB_PATH>/    -> xui:2096    (сервер подписок 3X-UI)
    всё остальное   -> fakeapp:8080 (сайт-обманка)
@@ -117,7 +118,7 @@ sudo DOMAIN=app.example.com ACME_EMAIL=me@example.com APP_NAME=Notely \
 | `stop` | root или `vpn` | `docker compose stop` |
 | `restart` | root или `vpn` | stop + start |
 | `status` | root или `vpn` | Состояние контейнеров и сертификата |
-| `links` | root или `vpn` | URL панели, логин/пароль, адрес `/random-<RANDOM_DATA_SUFFIX>`, ссылки клиентов и URL подписок |
+| `links` | root или `vpn` | Добавляет хосты ссылок новым входам XHTTP (`configure-hosts`), затем выводит URL панели, логин/пароль, адрес `/random-<RANDOM_DATA_SUFFIX>`, ссылки клиентов и URL подписок |
 | `remove` | root | Удалить контейнеры и собранные образы |
 | `remove --purge` | root | Дополнительно удалить данные, rootless Docker, пользователя и sysctl-файл |
 
@@ -145,7 +146,7 @@ scripts/certs.sh renew       # принудительное продление
 scripts/xui.sh links         # ссылки клиентов
 scripts/xui.sh configure-panel   # логин/пароль/порт/путь панели из .env
 scripts/xui.sh provision     # создать входы reality и xhttp, если их нет (и хосты ссылок)
-scripts/xui.sh configure-hosts   # хосты 3X-UI: ссылки панели/подписок на DOMAIN:443 (идемпотентно)
+scripts/xui.sh configure-hosts   # хосты 3X-UI: ссылки панели/подписок на DOMAIN:443, в т.ч. для новых входов XHTTP (идемпотентно)
 scripts/xui.sh configure-sub     # настройки подписок в панели из .env (идемпотентно)
 scripts/xui.sh sub-links     # URL подписок всех клиентов
 scripts/xui.sh genkeys       # напечатать новые ключи (ничего не записывает)
@@ -184,6 +185,7 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `XHTTP_PATH` | сгенерировано | Секретный путь XHTTP |
 | `XHTTP_PORT` | по умолчанию | `10000` (внутри сети) |
 | `NGINX_TLS_PORT` | по умолчанию | `8443` (цель REALITY, внутри сети) |
+| `XHTTP_ROUTE_PORT_MIN`, `XHTTP_ROUTE_PORT_MAX` | по умолчанию | `10000`, `19999`: диапазон портов дополнительных входов XHTTP (см. «Дополнительные входы XHTTP»). Не должен включать `PANEL_PORT`, `SUB_PORT`, `NGINX_TLS_PORT` (иначе nginx не запустится). Изменение: `vpn.sh restart` |
 | `REALITY_PRIVATE_KEY`, `REALITY_PUBLIC_KEY` | сгенерировано | Ключи x25519 |
 | `REALITY_SHORT_ID` | сгенерировано | 8-16 hex-символов |
 | `CLIENT_UUID` | сгенерировано | UUID клиента (общий для обоих входов) |
@@ -335,6 +337,31 @@ https://DOMAIN/SUB_PATH/<subId>
 ### Дополнительные пользователи
 
 В панели 3X-UI откройте вход `reality` и `xhttp`, добавьте клиентов. Электронная почта (email) клиента должна быть уникальной в пределах панели, один и тот же человек может иметь по клиенту на каждом входе с разными email. Ссылки и QR берутся из панели. Для REALITY-клиентам задайте Flow `xtls-rprx-vision`. Чтобы у человека была одна подписка со всеми ссылками, задайте клиентам на обоих входах одинаковый `subId` (его URL: `https://DOMAIN/SUB_PATH/<subId>`).
+
+### Дополнительные входы XHTTP
+
+Новый вход XHTTP (например, с другими `xPaddingBytes`, `mode` или своим набором клиентов) создается только в панели, без правки nginx. nginx направляет `https://DOMAIN/<XHTTP_PATH>-<порт>/` на `xui:<порт>` для любого порта из `XHTTP_ROUTE_PORT_MIN`..`XHTTP_ROUTE_PORT_MAX` (по умолчанию 10000-19999).
+
+Правила для входа (Inbounds → Add Inbound):
+
+| Поле | Значение |
+|---|---|
+| Protocol | `vless` |
+| Listen IP | пусто |
+| Port | свободный порт из диапазона, кроме `XHTTP_PORT` (10000), например `10001` |
+| Transmission | `XHTTP` |
+| Path | `/<XHTTP_PATH>-<порт>/`, например `/3xo28djspgt9c3y6gwi3j3-10001/` (`XHTTP_PATH` из `.env`, номер порта должен совпадать с полем Port) |
+| Host | пусто |
+| Security | `none` (TLS снимает nginx) |
+| Sockopt → Trusted X-Forwarded-For | `X-Real-IP` (по желанию: тогда в журнале Xray видны реальные IP) |
+| Клиенты | Flow пустой; `subId` как у других клиентов человека, если нужна одна подписка |
+
+Затем выполните `sudo ./vpn.sh links` (или `scripts/xui.sh configure-hosts`). Скрипт найдет новый вход и добавит ему хосты `h2` и `h3` (`DOMAIN:443`, TLS, SNI и Host `DOMAIN`, fingerprint `chrome`), после чего ссылки и QR в панели и подписка будут рабочими. Перезапуск nginx или xui не нужен.
+
+- Хосты добавляются только входу, у которого их еще нет. Если вы изменили или добавили хосты такого входа вручную, скрипт их не трогает.
+- Если путь не совпадает с `/<XHTTP_PATH>-<порт>/` или Security не `none`, скрипт выведет предупреждение и хосты не создаст: такой вход nginx не обслуживает (запросы уходят на сайт-обманку).
+- Порт вне диапазона nginx не маршрутизирует. Наружу порты входов не публикуются, клиенты всегда подключаются к 443.
+- Входы на 443/tcp (REALITY) создавать нельзя: порт уже занят входом `reality`.
 
 ## 8. Панель 3X-UI
 
