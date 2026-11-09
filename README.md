@@ -188,6 +188,7 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `REALITY_SHORT_ID` | сгенерировано | 8-16 hex-символов |
 | `CLIENT_UUID` | сгенерировано | UUID клиента (общий для обоих входов) |
 | `DATA_DIR` | по умолчанию | `./data` (БД панели, сертификаты, состояние acme.sh) |
+| `XUI_DB_JOURNAL_MODE` | по умолчанию | `DELETE`: БД панели целиком в `data/xui/x-ui.db`, без `-wal`/`-shm` (проще бэкап). `WAL` — режим 3X-UI по умолчанию. Применяется при перезапуске `xui` (`vpn.sh restart`) |
 | `DOCKER_SUBNET` | по умолчанию | `172.30.53.0/24`; nginx доверяет PROXY protocol только из этой подсети |
 | `XUI_IMAGE`, `NGINX_IMAGE`, `ACME_IMAGE` | по умолчанию | Закрепленные версии образов |
 
@@ -375,7 +376,7 @@ sudo tar -C /home/vpn/vpn-stack -czf /root/vpn-backup-$(date +%Y%m%d).tar.gz .en
 sudo ./vpn.sh start
 ```
 
-Каталог `data/xui` копируйте целиком: при `XUI_DB_JOURNAL_MODE=WAL` рядом с `x-ui.db` лежат `x-ui.db-wal` и `x-ui.db-shm`, и часть данных находится в них. В режиме `DELETE` все данные лежат в одном `x-ui.db`. Восстановление: распакуйте архив в `VPN_DIR` на новом сервере после `deploy` (с тем же `DOMAIN`) и выполните `sudo ./vpn.sh restart`.
+По умолчанию `XUI_DB_JOURNAL_MODE=DELETE`, и вся БД панели лежит в `x-ui.db`. Каталог `data/xui` всё равно копируйте целиком: при `XUI_DB_JOURNAL_MODE=WAL` рядом с `x-ui.db` лежат `x-ui.db-wal` и `x-ui.db-shm`, и часть данных находится в них. В режиме `DELETE` все данные лежат в одном `x-ui.db`. Восстановление: распакуйте архив в `VPN_DIR` на новом сервере после `deploy` (с тем же `DOMAIN`) и выполните `sudo ./vpn.sh restart`.
 
 ## 11. Удаление
 
