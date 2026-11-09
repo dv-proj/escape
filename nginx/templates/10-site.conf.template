@@ -1,0 +1,97 @@
+# Public site for ${DOMAIN}.
+#
+# Only the variables listed in NGINX_ENVSUBST_FILTER (docker-compose.yml) are
+# substituted; every other $name below is an nginx runtime variable.
+
+# --- Plain HTTP: ACME HTTP-01 challenges, everything else -> https ----------
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://${DOMAIN}$request_uri;
+    }
+}
+
+# --- HTTPS ----------------------------------------------------------------------
+# TCP: Xray REALITY (host port 443) forwards every non-REALITY TLS connection
+#      here unchanged, prefixed with a PROXY protocol header (xver) carrying
+#      the real client address. nginx does the actual TLS handshake with the
+#      real Let's Encrypt certificate.
+# UDP: host port 443 is published straight to this container for HTTP/3.
+server {
+    listen ${NGINX_TLS_PORT} ssl default_server proxy_protocol;
+    listen 443 quic reuseport default_server;
+    server_name ${DOMAIN};
+
+    http2 on;
+    http3 on;
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # Trust PROXY protocol only from the internal docker network (Xray).
+    # QUIC connections carry no PROXY header and keep their own address.
+    set_real_ip_from ${DOCKER_SUBNET};
+    real_ip_header proxy_protocol;
+
+    # Long-lived XHTTP streams (values from XTLS/Xray-examples VLESS-XHTTP3-Nginx).
+    client_header_timeout 5m;
+    keepalive_timeout 5m;
+
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    add_header Strict-Transport-Security "max-age=63072000" always;
+
+    set $xhttp_upstream xui:${XHTTP_PORT};
+    set $panel_upstream xui:${PANEL_PORT};
+    set $app_upstream   fakeapp:8080;
+
+    # VLESS + XHTTP. Xray's XHTTP inbound speaks h2c, so grpc_pass is used:
+    # it streams request bodies (needed for stream-one / stream-up modes)
+    # instead of buffering them like proxy_pass would.
+    location /${XHTTP_PATH}/ {
+        access_log off;
+        client_max_body_size 0;
+        client_body_timeout 5m;
+        grpc_read_timeout 315s;
+        grpc_send_timeout 5m;
+        grpc_set_header Host $host;
+        grpc_set_header X-Real-IP $remote_addr;
+        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        grpc_pass grpc://$xhttp_upstream;
+    }
+
+    # 3X-UI panel (webBasePath = /${PANEL_PATH}/).
+    location = /${PANEL_PATH} {
+        return 301 /${PANEL_PATH}/;
+    }
+
+    location /${PANEL_PATH}/ {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 300s;
+        proxy_pass http://$panel_upstream;
+    }
+
+    # Decoy web application.
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_pass http://$app_upstream;
+    }
+}

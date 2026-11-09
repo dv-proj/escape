@@ -1,0 +1,156 @@
+# Personal VPN stack: 3X-UI/Xray (REALITY + XHTTP) behind a decoy website.
+#
+# Traffic flow:
+#   TCP 443 -> xui (Xray VLESS+REALITY). Authenticated REALITY clients are
+#              proxied by Xray; everything else (browsers, active probes, plain
+#              TLS clients incl. VLESS+XHTTP+TLS) is forwarded unchanged to
+#              nginx:${NGINX_TLS_PORT} with a PROXY protocol header.
+#   UDP 443 -> nginx (HTTP/3, same certificate).
+#   TCP 80  -> nginx (ACME HTTP-01 challenge + redirect to https).
+#   nginx routes /${XHTTP_PATH}/ -> xui:${XHTTP_PORT} (XHTTP, h2c),
+#                /${PANEL_PATH}/ -> xui:${PANEL_PORT} (3X-UI panel),
+#                everything else -> fakeapp:8080 (decoy web application).
+#
+# All values come from .env (see .env.example). Bootstrap order is handled by
+# scripts/certs.sh and scripts/xui.sh.
+
+name: vpn
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  logging: *logging
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  xui:
+    <<: *hardening
+    image: ${XUI_IMAGE:-ghcr.io/mhsanaei/3x-ui:v3.11.0}
+    hostname: xui
+    environment:
+      TZ: ${TZ:-UTC}
+      # Panel port inside the network (overrides the DB setting at runtime).
+      XUI_PORT: ${PANEL_PORT:-2053}
+      # Bundled fail2ban needs iptables + NET_ADMIN; not available/wanted here.
+      XUI_ENABLE_FAIL2BAN: "false"
+      XRAY_VMESS_AEAD_FORCED: "false"
+    ports:
+      # REALITY inbound. The panel port is intentionally NOT published.
+      - "443:443/tcp"
+    volumes:
+      - ${DATA_DIR:-./data}/xui:/etc/x-ui
+      # Let's Encrypt certificate (managed by acme). The panel itself is served
+      # over plain HTTP inside the network; TLS is terminated by nginx.
+      - ${DATA_DIR:-./data}/certs:/root/cert:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "${PANEL_PORT:-2053}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      nginx:
+        condition: service_started
+    networks:
+      - vpn
+
+  nginx:
+    <<: *hardening
+    image: ${NGINX_IMAGE:-nginx:1.31.8-alpine}
+    # Master process runs as (container) root to read the 0600 private key and
+    # bind ports; workers drop to the `nginx` user. Under rootless docker
+    # container root is an unprivileged host user.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    read_only: true
+    environment:
+      TZ: ${TZ:-UTC}
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      PANEL_PATH: ${PANEL_PATH:?PANEL_PATH is required}
+      PANEL_PORT: ${PANEL_PORT:-2053}
+      XHTTP_PATH: ${XHTTP_PATH:?XHTTP_PATH is required}
+      XHTTP_PORT: ${XHTTP_PORT:-10000}
+      NGINX_TLS_PORT: ${NGINX_TLS_PORT:-8443}
+      DOCKER_SUBNET: ${DOCKER_SUBNET:-172.30.53.0/24}
+      # Only these variables are substituted into /etc/nginx/templates/*;
+      # nginx's own $variables are left untouched.
+      NGINX_ENVSUBST_FILTER: "^(DOMAIN|PANEL_PATH|PANEL_PORT|XHTTP_PATH|XHTTP_PORT|NGINX_TLS_PORT|DOCKER_SUBNET)$$"
+      # Certificate watcher (nginx/docker-entrypoint.d/40-cert-reload.sh).
+      CERT_RELOAD_INTERVAL: "300"
+    ports:
+      - "80:80/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/docker-entrypoint.d/40-cert-reload.sh:/docker-entrypoint.d/40-cert-reload.sh:ro
+      - ${DATA_DIR:-./data}/certs:/etc/nginx/certs:ro
+      - ${DATA_DIR:-./data}/webroot:/var/www/acme:ro
+    tmpfs:
+      # Rendered templates go here; also hides the image's default.conf.
+      - /etc/nginx/conf.d
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:81/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      fakeapp:
+        condition: service_healthy
+    networks:
+      - vpn
+
+  acme:
+    <<: *hardening
+    image: ${ACME_IMAGE:-neilpang/acme.sh:3.1.6}
+    # Runs supercronic with the acme.sh renewal job; renewed certificates are
+    # re-installed into /certs automatically (settings saved by --install-cert).
+    command: ["daemon"]
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${DATA_DIR:-./data}/acme:/acme.sh
+      - ${DATA_DIR:-./data}/certs:/certs
+      - ${DATA_DIR:-./data}/webroot:/webroot
+    depends_on:
+      nginx:
+        condition: service_started
+    networks:
+      - vpn
+
+  fakeapp:
+    <<: *hardening
+    build: ./fake-webapp
+    read_only: true
+    environment:
+      LISTEN_ADDR: ":8080"
+      APP_NAME: ${APP_NAME:?APP_NAME is required}
+      APP_DESCRIPTION: ${APP_DESCRIPTION:-}
+      APP_KEYWORDS: ${APP_KEYWORDS:-}
+      BASE_URL: https://${DOMAIN:?DOMAIN is required}
+      RATE_LIMIT_RPS: "10"
+      TZ: ${TZ:-UTC}
+    tmpfs:
+      - /tmp
+    networks:
+      - vpn
+
+networks:
+  vpn:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.30.53.0/24}
