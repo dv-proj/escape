@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const testSuffix = "0123abcd9f"
+const (
+	testSuffix = "0123abcd9f"
+	testSeed   = "00112233445566778899aabbccddeeff"
+)
 
 type fakeClock struct{ t time.Time }
 
@@ -19,8 +22,11 @@ func (c *fakeClock) Now() time.Time { return c.t }
 
 func newTestApp(rps float64) (*App, *fakeClock, http.Handler) {
 	clk := &fakeClock{t: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
-	cfg := Config{AppName: "Test Portal", Description: "Desc here", Keywords: "k1, k2", BaseURL: "https://example.com", RateLimit: rps, RandomSuffix: testSuffix}
-	a := NewApp(cfg, clk.Now)
+	cfg := Config{AppName: "Test Portal", Description: "Desc here", Keywords: "k1, k2", BaseURL: "https://example.com", RateLimit: rps, RandomSuffix: testSuffix, PageSeed: testSeed}
+	a, err := NewApp(cfg, clk.Now)
+	if err != nil {
+		panic(err)
+	}
 	return a, clk, a.Handler()
 }
 
@@ -45,13 +51,8 @@ func TestIndex(t *testing.T) {
 		t.Fatalf("code %d", rec.Code)
 	}
 	b := rec.Body.String()
-	for _, want := range []string{
-		"<title>Test Portal</title>", `name="description" content="Desc here"`, `name="keywords" content="k1, k2"`,
-		`name="robots" content="index, follow"`, `rel="canonical" href="https://example.com"`,
-		`property="og:title"`, `property="og:type" content="website"`, `property="og:url" content="https://example.com"`,
-		`name="twitter:card"`, `name="viewport"`, `charset="utf-8"`, "application/ld+json", `"@type":"WebApplication"`,
-		`action="/login"`, "2026-01-01 12:00:00",
-	} {
+	checkSEO(t, b, "https://example.com", "Test Portal", "Desc here", "k1, k2")
+	for _, want := range []string{"application/ld+json", `"@type":"WebApplication"`, `action="/login"`, "2026-01-01 12:00:00"} {
 		if !strings.Contains(b, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -80,10 +81,10 @@ func TestLoginThrottle(t *testing.T) {
 			t.Fatalf("attempt %d: got %d want %d", i+1, rec.Code, want)
 		}
 		if want == 429 {
-			if rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), "Too many attempts") {
+			if rec.Header().Get("Retry-After") == "" || !strings.Contains(strings.ToLower(rec.Body.String()), "too many") {
 				t.Fatal("429 lacks Retry-After/message")
 			}
-		} else if !strings.Contains(rec.Body.String(), "incorrect") || !strings.Contains(rec.Body.String(), "<form") {
+		} else if !strings.Contains(strings.ToLower(rec.Body.String()), "incorrect") || !strings.Contains(rec.Body.String(), "<form") {
 			t.Fatal("401 page lacks message/form")
 		}
 	}
@@ -177,13 +178,23 @@ func TestGlobalLimiter(t *testing.T) {
 
 func TestConfigValidate(t *testing.T) {
 	for _, v := range []string{"", "short", "0123456", "0123456789abc", "0123ABCD9f", "0123abcg9f"} {
-		if (Config{RandomSuffix: v}).validate() == nil {
+		if (Config{RandomSuffix: v, PageSeed: testSeed}).validate() == nil {
 			t.Errorf("%q accepted", v)
 		}
 	}
 	for _, v := range []string{"01234567", "0123456789ab"} {
-		if err := (Config{RandomSuffix: v}).validate(); err != nil {
+		if err := (Config{RandomSuffix: v, PageSeed: testSeed}).validate(); err != nil {
 			t.Errorf("%q: %v", v, err)
+		}
+	}
+	for _, v := range []string{"", "0123456789abcde", "ABCDEF0123456789", "xyz0123456789abc", strings.Repeat("a", 65)} {
+		if (Config{RandomSuffix: testSuffix, PageSeed: v}).validate() == nil {
+			t.Errorf("seed %q accepted", v)
+		}
+	}
+	for _, v := range []string{"0123456789abcdef", strings.Repeat("f", 64)} {
+		if err := (Config{RandomSuffix: testSuffix, PageSeed: v}).validate(); err != nil {
+			t.Errorf("seed %q: %v", v, err)
 		}
 	}
 }

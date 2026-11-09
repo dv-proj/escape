@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"html/template"
@@ -17,16 +16,18 @@ import (
 // MaxRandomDataSize is the maximum number of bytes /random-<suffix> may return.
 const MaxRandomDataSize = 500000
 
-//go:embed templates/*.html
-var templatesFS embed.FS
-
-var pageTmpl = template.Must(template.ParseFS(templatesFS, "templates/page.html"))
+// Page states passed to the template as .State; the texts live in the template.
+const (
+	stateInvalid   = "invalid"
+	stateThrottled = "throttled"
+)
 
 type pageData struct {
 	AppName, Description, Keywords, BaseURL string
 	JSONLD                                  template.JS
 	Nonce                                   string
-	Error                                   string
+	State                                   string
+	Year                                    int
 	HideForm                                bool
 	Time                                    string
 	UnixMilli                               int64
@@ -40,10 +41,16 @@ type App struct {
 	global   *bucket
 	throttle *loginThrottle
 	jsonLD   template.JS
+	page     *template.Template
 }
 
-func NewApp(cfg Config, now Clock) *App {
-	a := &App{cfg: cfg, now: now, global: newBucket(cfg.RateLimit, now), throttle: newLoginThrottle(now)}
+// NewApp builds the app; the page template comes from loadPage.
+func NewApp(cfg Config, now Clock) (*App, error) {
+	page, err := loadPage(cfg)
+	if err != nil {
+		return nil, err
+	}
+	a := &App{cfg: cfg, now: now, global: newBucket(cfg.RateLimit, now), throttle: newLoginThrottle(now), page: page}
 	ld := map[string]any{
 		"@context":            "https://schema.org",
 		"@type":               "WebApplication",
@@ -58,7 +65,7 @@ func NewApp(cfg Config, now Clock) *App {
 	}
 	b, _ := json.Marshal(ld)
 	a.jsonLD = template.JS(b)
-	return a
+	return a, nil
 }
 
 // Handler returns the full middleware chain.
@@ -139,7 +146,7 @@ func (a *App) limit(next http.Handler) http.Handler {
 func (a *App) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-		a.renderPage(w, r, http.StatusOK, "", false)
+		a.renderPage(w, r, http.StatusOK, "")
 	case r.URL.Path == "/login" && r.Method == http.MethodPost:
 		a.login(w, r)
 	case r.URL.Path == "/random-"+a.cfg.RandomSuffix && r.Method == http.MethodGet:
@@ -153,13 +160,13 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *App) renderPage(w http.ResponseWriter, r *http.Request, status int, msg string, hideForm bool) {
+func (a *App) renderPage(w http.ResponseWriter, r *http.Request, status int, state string) {
 	t := a.now()
 	_, off := t.Zone()
 	d := pageData{
 		AppName: a.cfg.AppName, Description: a.cfg.Description, Keywords: a.cfg.Keywords,
 		BaseURL: a.cfg.BaseURL, JSONLD: a.jsonLD, Nonce: nonceFrom(r),
-		Error: msg, HideForm: hideForm,
+		State: state, HideForm: state == stateThrottled, Year: t.Year(),
 		Time: t.Format("2006-01-02 15:04:05"), UnixMilli: t.UnixMilli(), OffsetSec: off,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -168,7 +175,7 @@ func (a *App) renderPage(w http.ResponseWriter, r *http.Request, status int, msg
 	if r.Method == http.MethodHead {
 		return
 	}
-	if err := pageTmpl.Execute(w, d); err != nil {
+	if err := a.page.Execute(w, d); err != nil {
 		slog.Error("template", "err", err)
 	}
 }
@@ -181,10 +188,10 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		secs := int((retry + time.Second - 1) / time.Second)
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		a.renderPage(w, r, http.StatusTooManyRequests, "Too many attempts, please try again later.", true)
+		a.renderPage(w, r, http.StatusTooManyRequests, stateThrottled)
 		return
 	}
-	a.renderPage(w, r, http.StatusUnauthorized, "The username or password is incorrect. Please try again.", false)
+	a.renderPage(w, r, http.StatusUnauthorized, stateInvalid)
 }
 
 func (a *App) randomData(w http.ResponseWriter, r *http.Request) {

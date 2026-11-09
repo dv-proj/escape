@@ -52,8 +52,10 @@ KEY_FILE=privkey.pem
 # shellcheck disable=SC2016  # the script below is expanded by the container shell
 BOOTSTRAP_SCRIPT='
 set -eu
-mkdir -p /data/certs /data/acme /data/xui /data/webroot
-chmod 700 /data/certs /data/acme /data/xui
+mkdir -p /data/certs /data/acme /data/xui /data/webroot /data/fakeapp
+chmod 700 /data/certs /data/acme /data/xui /data/fakeapp
+# fakeapp runs as the distroless nonroot user (65532) and writes page.html here.
+chown 65532:65532 /data/fakeapp
 chmod 755 /data/webroot
 if [ -s /data/certs/fullchain.pem ] && [ -s /data/certs/privkey.pem ]; then
     echo exists

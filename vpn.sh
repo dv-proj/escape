@@ -291,6 +291,9 @@ ask() {
 # gen_random_data_suffix: lowercase hex, 8-12 chars.
 gen_random_data_suffix() { rand_str $((8 + RANDOM % 5)) '0-9a-f'; }
 
+# gen_page_seed: 32 lowercase hex chars (seed of the decoy login page variant).
+gen_page_seed() { rand_str 32 '0-9a-f'; }
+
 # ensure_generated_key FILE KEY GENERATOR_FN: append KEY=<generated> to an existing
 # .env when KEY is missing or empty; other lines are left untouched.
 ensure_generated_key() {
@@ -356,6 +359,7 @@ generate_env() {
     ENV_VALUES[XHTTP_PATH]="$xpath"
     ENV_VALUES[PANEL_PASSWORD]="$(rand_str 28 'A-Za-z0-9')"
     ENV_VALUES[RANDOM_DATA_SUFFIX]="$(gen_random_data_suffix)"
+    ENV_VALUES[PAGE_SEED]="$(gen_page_seed)"
 
     local keys_out
     keys_out="$(gen_secrets)" || die "key generation failed"
@@ -706,6 +710,7 @@ setup_env() {
     if [[ -f "$envf" ]]; then
         ok "$envf exists; reusing it (no questions asked)"
         ensure_generated_key "$envf" RANDOM_DATA_SUFFIX gen_random_data_suffix
+        ensure_generated_key "$envf" PAGE_SEED gen_page_seed
         return 0
     fi
     [[ -f "$VPN_DIR/.env.example" ]] || die "$VPN_DIR/.env.example is missing"
