@@ -69,7 +69,7 @@ sudo ufw allow 443/udp
 ## 4. Быстрый старт
 
 ```bash
-git clone <URL-репозитория> escape
+git clone https://github.com/dv-proj/escape
 cd escape
 sudo ./vpn.sh deploy
 ```
