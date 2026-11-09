@@ -27,7 +27,10 @@ Commands:
                    DOMAIN:443 with TLS (xhttp: h2 and h3 variants) instead of
                    the inbound's internal port/security. Matches hosts by
                    remark; changes nothing when they are already right.
-                   Idempotent.
+                   Also adds h2/h3 hosts to additional XHTTP inbounds
+                   (port in XHTTP_ROUTE_PORT_MIN..MAX, path
+                   /XHTTP_PATH-<port>/, security none) that have no host
+                   yet; their existing hosts are never changed. Idempotent.
   configure-sub    Apply the subscription settings through the panel API
                    (enabled, port SUB_PORT, path /SUB_PATH/, public URL
                    https://DOMAIN/SUB_PATH/, no TLS on the sub server: nginx
@@ -48,7 +51,8 @@ Environment (.env at the repo root, or ENV_FILE=path):
   provision        DOMAIN CLIENT_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
                    REALITY_SHORT_ID XHTTP_PATH [XHTTP_PORT=10000]
                    [NGINX_TLS_PORT=8443] [PANEL_PORT=2053]
-  configure-hosts  DOMAIN [PANEL_PORT=2053] [PANEL_PATH]
+  configure-hosts  DOMAIN XHTTP_PATH [PANEL_PORT=2053] [PANEL_PATH]
+                   [XHTTP_ROUTE_PORT_MIN=10000] [XHTTP_ROUTE_PORT_MAX=19999]
   configure-sub    DOMAIN SUB_PATH [SUB_PORT=2096] [PANEL_PORT=2053] [PANEL_PATH]
   sub-links        DOMAIN SUB_PATH [PANEL_PORT=2053] [PANEL_PATH]
   links            DOMAIN CLIENT_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID
@@ -95,6 +99,15 @@ validate_common() {
     validate XHTTP_PORT '^[0-9]{1,5}$' "a port number"
     validate SUB_PORT '^[0-9]{1,5}$' "a port number"
     validate NGINX_TLS_PORT '^[0-9]{1,5}$' "a port number"
+    validate XHTTP_ROUTE_PORT_MIN '^[0-9]{1,5}$' "a port number"
+    validate XHTTP_ROUTE_PORT_MAX '^[0-9]{1,5}$' "a port number"
+    ((XHTTP_ROUTE_PORT_MIN >= 1024 && XHTTP_ROUTE_PORT_MIN <= XHTTP_ROUTE_PORT_MAX && XHTTP_ROUTE_PORT_MAX <= 65535)) ||
+        die "need 1024 <= XHTTP_ROUTE_PORT_MIN <= XHTTP_ROUTE_PORT_MAX <= 65535"
+    local p
+    for p in "$PANEL_PORT" "$SUB_PORT" "$NGINX_TLS_PORT"; do
+        ((p < XHTTP_ROUTE_PORT_MIN || p > XHTTP_ROUTE_PORT_MAX)) ||
+            die "port $p (PANEL_PORT/SUB_PORT/NGINX_TLS_PORT) is inside XHTTP_ROUTE_PORT_MIN..MAX"
+    done
 }
 
 # --- helpers ---------------------------------------------------------------------------
@@ -331,18 +344,27 @@ cmd_provision() {
 #   add<TAB><HostGroup JSON>   |   update<TAB><groupId><TAB><HostGroup JSON>
 # Existing groups (matched by remark + inbound) are merged, so fields not
 # managed here (sort order, tags, ...) survive an update.
+# Additional XHTTP inbounds (created in the panel, port in
+# XHTTP_ROUTE_PORT_MIN..MAX, path /<XHTTP_PATH>-<port>/, security none) get
+# h2 and h3 hosts too, but only while they have no host at all: once a host
+# exists for such an inbound it is left to the user.
 # argv: DOMAIN REALITY_INBOUND XHTTP_INBOUND REALITY_HOST H2_HOST H3_HOST
+#       XHTTP_PATH PORT_MIN PORT_MAX
 HOSTS_PLAN_PY='
 import json, sys
-domain, in_reality, in_xhttp, host_reality, host_h2, host_h3 = sys.argv[1:7]
+domain, in_reality, in_xhttp, host_reality, host_h2, host_h3, xhttp_path = sys.argv[1:8]
+port_min, port_max = int(sys.argv[8]), int(sys.argv[9])
 inbounds = json.loads(sys.stdin.readline()).get("obj") or []
 groups = json.loads(sys.stdin.readline()).get("obj") or []
 ids = {i["remark"]: i["id"] for i in inbounds}
 
-def want(inbound, remark, security, sni, header, alpn, fp):
-    return {"inboundIds": [ids[inbound]], "hosts": [domain], "remark": remark,
+def want_id(inbound_id, remark, security, sni, header, alpn, fp):
+    return {"inboundIds": [inbound_id], "hosts": [domain], "remark": remark,
             "port": 443, "security": security, "sni": sni, "hostHeader": header,
             "alpn": alpn, "fingerprint": fp, "isDisabled": False}
+
+def want(inbound, *rest):
+    return want_id(ids[inbound], *rest)
 
 desired = []
 if in_reality in ids:
@@ -354,6 +376,36 @@ if in_xhttp in ids:
     desired.append(want(in_xhttp, host_h3, "tls", domain, domain, ["h3"], "chrome"))
 else:
     sys.stderr.write("inbound %r not found; skipping its hosts\n" % in_xhttp)
+
+def stream_of(inbound):
+    st = inbound.get("streamSettings") or "{}"
+    try:
+        return json.loads(st) if isinstance(st, str) else st
+    except ValueError:
+        return {}
+
+with_hosts = {i for g in groups for i in (g.get("inboundIds") or [])}
+managed = {ids.get(in_reality), ids.get(in_xhttp)}
+for inb in inbounds:
+    st = stream_of(inb)
+    if inb["id"] in managed or st.get("network") != "xhttp":
+        continue
+    port = int(inb.get("port") or 0)
+    if not port_min <= port <= port_max:
+        continue
+    name = inb.get("remark") or "#%d" % inb["id"]
+    path = ((st.get("xhttpSettings") or {}).get("path") or "").rstrip("/")
+    expected = "/%s-%d" % (xhttp_path, port)
+    if path != expected:
+        sys.stderr.write("inbound %r (port %d): path %r is not routed by nginx; set it to %r\n" % (name, port, path or "/", expected + "/"))
+        continue
+    if st.get("security", "none") != "none":
+        sys.stderr.write("inbound %r (port %d): security must be none (nginx terminates TLS); skipping its hosts\n" % (name, port))
+        continue
+    if inb["id"] in with_hosts:
+        continue
+    desired.append(dict(want_id(inb["id"], host_h2, "tls", domain, domain, ["h2"], "chrome")))
+    desired.append(dict(want_id(inb["id"], host_h3, "tls", domain, domain, ["h3"], "chrome")))
 
 def same(group, w):
     for k, v in w.items():
@@ -384,7 +436,8 @@ apply_hosts() {
     api_ok "$hosts" || die "hosts/list failed: $(api_msg "$hosts") (response: ${hosts:0:200})"
     plan="$(printf '%s\n%s\n' "$inbounds" "$hosts" |
         xui_exec python3 -I -c "$HOSTS_PLAN_PY" "$DOMAIN" "$REALITY_REMARK" "$XHTTP_REMARK" \
-            "$REALITY_HOST_REMARK" "$XHTTP_H2_HOST_REMARK" "$XHTTP_H3_HOST_REMARK")" ||
+            "$REALITY_HOST_REMARK" "$XHTTP_H2_HOST_REMARK" "$XHTTP_H3_HOST_REMARK" \
+            "$XHTTP_PATH" "$XHTTP_ROUTE_PORT_MIN" "$XHTTP_ROUTE_PORT_MAX")" ||
         die "could not compute the host changes"
     while IFS=$'\t' read -r action a b; do
         [[ -n "$action" ]] || continue
@@ -400,7 +453,7 @@ apply_hosts() {
 }
 
 cmd_configure_hosts() {
-    require_vars DOMAIN
+    require_vars DOMAIN XHTTP_PATH
     api_session_start
     apply_hosts
 }

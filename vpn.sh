@@ -77,7 +77,9 @@ Commands:
   stop      Stop the stack (docker compose stop).
   restart   Stop and start the stack.
   status    Show container and certificate status.
-  links     Print panel URL/credentials, client links and subscription URLs.
+  links     Add link hosts for new XHTTP inbounds (scripts/xui.sh
+            configure-hosts), then print panel URL/credentials, client links
+            and subscription URLs.
   remove    Remove the containers and built images (root). With --purge also
             deletes all data (certs, panel DB), the rootless Docker install,
             the VPN user and the sysctl file. Packages are never removed.
@@ -1164,6 +1166,10 @@ cmd_status() {
 
 cmd_links() {
     require_installed
+    # Adds DOMAIN:443 link hosts for XHTTP inbounds created in the panel since
+    # the last run (existing hosts are not changed), so their panel and
+    # subscription links work. Its log goes to stderr.
+    in_stack scripts/xui.sh configure-hosts >&2 || warn "could not update the link hosts (is the stack running?)"
     print_summary
 }
 
