@@ -1,0 +1,38 @@
+# http-level settings (included inside the http {} block of the stock
+# /etc/nginx/nginx.conf). Rendered by the official image's envsubst step.
+
+server_tokens off;
+
+# Docker's embedded DNS. Upstreams are referenced through variables so they
+# are resolved lazily: nginx starts even if xui/fakeapp are not up yet and
+# picks up new container IPs after restarts.
+resolver 127.0.0.11 valid=30s ipv6=off;
+resolver_timeout 5s;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# TLS defaults shared by the TCP (REALITY target) and QUIC listeners.
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_cache shared:SSL:10m;
+ssl_session_timeout 1d;
+ssl_session_tickets off;
+
+# Local-only endpoint for the container healthcheck.
+server {
+    listen 127.0.0.1:81;
+    access_log off;
+
+    location = /health {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 404;
+    }
+}
