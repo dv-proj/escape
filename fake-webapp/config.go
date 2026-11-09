@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 )
 
@@ -13,6 +15,18 @@ type Config struct {
 	Keywords    string
 	BaseURL     string
 	RateLimit   float64
+	// RandomSuffix makes the data endpoint /random-<suffix>.
+	RandomSuffix string
+}
+
+var suffixRe = regexp.MustCompile(`^[0-9a-f]{8,12}$`)
+
+// validate reports whether the config is usable.
+func (c Config) validate() error {
+	if !suffixRe.MatchString(c.RandomSuffix) {
+		return fmt.Errorf("RANDOM_DATA_SUFFIX must match ^[0-9a-f]{8,12}$")
+	}
+	return nil
 }
 
 func getenv(key, def string) string {
@@ -30,11 +44,12 @@ func loadConfig() Config {
 		}
 	}
 	return Config{
-		ListenAddr:  getenv("LISTEN_ADDR", ":8080"),
-		AppName:     getenv("APP_NAME", "Cloud Portal"),
-		Description: getenv("APP_DESCRIPTION", "Secure sign-in to your cloud workspace: manage projects, files and team access in one place."),
-		Keywords:    getenv("APP_KEYWORDS", "cloud portal, workspace, sign in, dashboard, team collaboration"),
-		BaseURL:     getenv("BASE_URL", ""),
-		RateLimit:   rps,
+		ListenAddr:   getenv("LISTEN_ADDR", ":8080"),
+		AppName:      getenv("APP_NAME", "Cloud Portal"),
+		Description:  getenv("APP_DESCRIPTION", "Secure sign-in to your cloud workspace: manage projects, files and team access in one place."),
+		Keywords:     getenv("APP_KEYWORDS", "cloud portal, workspace, sign in, dashboard, team collaboration"),
+		BaseURL:      getenv("BASE_URL", ""),
+		RateLimit:    rps,
+		RandomSuffix: os.Getenv("RANDOM_DATA_SUFFIX"),
 	}
 }
