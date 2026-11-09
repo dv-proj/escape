@@ -42,6 +42,8 @@ services:
       XUI_PORT: ${PANEL_PORT:-2053}
       # Bundled fail2ban needs iptables + NET_ADMIN; not available/wanted here.
       XUI_ENABLE_FAIL2BAN: "false"
+      # SQLite journal mode of the panel DB (DELETE: single x-ui.db file, no -wal/-shm).
+      XUI_DB_JOURNAL_MODE: ${XUI_DB_JOURNAL_MODE:-DELETE}
       XRAY_VMESS_AEAD_FORCED: "false"
     ports:
       # REALITY inbound. The panel port is intentionally NOT published.
