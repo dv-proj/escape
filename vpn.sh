@@ -1088,6 +1088,59 @@ require_installed() {
     fi
 }
 
+# --- automatic link hosts (systemd user timer) -------------------------------------
+
+HOSTS_UNIT=vpn-hosts
+
+hosts_service_content() {
+    cat <<EOF
+# Managed by vpn.sh: adds DOMAIN:443 link hosts to XHTTP inbounds created in
+# the 3X-UI panel (scripts/xui.sh auto-hosts). Existing hosts are not changed.
+[Unit]
+Description=Add 3X-UI link hosts for new XHTTP inbounds
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=$VPN_DIR
+Environment=DOCKER_HOST=unix://%t/docker.sock
+Environment=XUI_API_TOKEN_NAME=vpn-auto-hosts
+ExecStart=/usr/bin/env bash scripts/xui.sh auto-hosts
+EOF
+}
+
+hosts_timer_content() {
+    cat <<'EOF'
+# Managed by vpn.sh.
+[Unit]
+Description=Add 3X-UI link hosts for new XHTTP inbounds every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# install_hosts_timer: write/refresh the user units and enable the timer.
+install_hosts_timer() {
+    local cfg="$VPN_HOME/.config/systemd/user"
+    as_vpn mkdir -p "$cfg"
+    hosts_service_content | as_vpn tee "$cfg/$HOSTS_UNIT.service" >/dev/null
+    hosts_timer_content | as_vpn tee "$cfg/$HOSTS_UNIT.timer" >/dev/null
+    as_vpn systemctl --user daemon-reload
+    as_vpn systemctl --user enable --now "$HOSTS_UNIT.timer" >/dev/null 2>&1 ||
+        die "could not enable $HOSTS_UNIT.timer for $VPN_USER"
+    ok "link hosts for new XHTTP inbounds are added automatically ($HOSTS_UNIT.timer, every minute)"
+}
+
+disable_hosts_timer() {
+    as_vpn systemctl --user disable --now "$HOSTS_UNIT.timer" >/dev/null 2>&1 || true
+}
+
 cmd_deploy() {
     require_root deploy
     STEP_TOTAL=12
@@ -1134,6 +1187,7 @@ cmd_deploy() {
     in_stack scripts/xui.sh provision
     in_stack scripts/xui.sh configure-sub
     in_stack scripts/certs.sh issue
+    install_hosts_timer
 
     CURRENT_STEP="summary"
     printf '\n%sDeploy finished.%s\n' "$C_BOLD" "$C_RESET" >&2
@@ -1240,6 +1294,7 @@ cmd_remove() {
     fi
 
     step "Removing containers and images"
+    disable_hosts_timer
     if [[ -f "$VPN_DIR/docker-compose.yml" && -f "$VPN_DIR/.env" ]] && docker_up_or_start; then
         local -a down=(docker compose down --remove-orphans --rmi local)
         ((PURGE)) && down+=(--volumes)
@@ -1261,6 +1316,7 @@ cmd_remove() {
     as_vpn dockerd-rootless-setuptool.sh uninstall >&2 || warn "setuptool uninstall reported an error"
     remove_data_dir "$VPN_HOME/.local/share/docker"
     rm -rf "$VPN_HOME/.config/systemd/user/docker.service.d"
+    rm -f "$VPN_HOME/.config/systemd/user/$HOSTS_UNIT.service" "$VPN_HOME/.config/systemd/user/$HOSTS_UNIT.timer"
 
     step "Removing the user $VPN_USER"
     loginctl disable-linger "$VPN_USER" || true
