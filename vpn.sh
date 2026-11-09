@@ -80,6 +80,9 @@ Commands:
   links     Add link hosts for new XHTTP inbounds (scripts/xui.sh
             configure-hosts), then print panel URL/credentials, client links
             and subscription URLs.
+  genkeys   Print a new REALITY x25519 key pair (private/public), a client
+            UUID and two REALITY short ids for manual panel setup. Writes
+            nothing; needs the rootless Docker of the VPN user.
   remove    Remove the containers and built images (root). With --purge also
             deletes all data (certs, panel DB), the rootless Docker install,
             the VPN user and the sysctl file. Packages are never removed.
@@ -1164,6 +1167,35 @@ cmd_status() {
     in_stack scripts/certs.sh status || warn "certificate status unavailable"
 }
 
+# genkeys: print a fresh x25519 key pair, a client UUID and two REALITY short
+# ids for configuring inbounds/clients in the panel by hand. Writes nothing.
+cmd_genkeys() {
+    require_installed
+    ensure_docker_running
+    local out line priv="" pub="" uuid="" sid1 sid2
+    out="$(in_stack scripts/xui.sh genkeys)" || die "key generation failed"
+    while IFS= read -r line; do
+        case "$line" in
+            REALITY_PRIVATE_KEY=*) priv="${line#*=}" ;;
+            REALITY_PUBLIC_KEY=*) pub="${line#*=}" ;;
+            CLIENT_UUID=*) uuid="${line#*=}" ;;
+        esac
+    done <<<"$out"
+    [[ -n "$priv" && -n "$pub" && -n "$uuid" ]] || die "unexpected output from genkeys"
+    # Two distinct short ids, each 4-8 random bytes (8-16 hex characters).
+    sid1="$(od -An -N"$(rand_int 4 8)" -tx1 /dev/urandom | tr -d ' \n')"
+    sid2="$sid1"
+    while [[ "$sid2" == "$sid1" ]]; do
+        sid2="$(od -An -N"$(rand_int 4 8)" -tx1 /dev/urandom | tr -d ' \n')"
+    done
+    printf 'Private key : %s\n' "$priv"
+    printf 'Public key  : %s\n' "$pub"
+    printf 'UUID        : %s\n' "$uuid"
+    printf 'Short ID 1  : %s\n' "$sid1"
+    printf 'Short ID 2  : %s\n' "$sid2"
+    printf '\nNothing was written. Panel: REALITY inbound -> Private Key / Public Key,\nShort IDs "%s,%s"; client -> ID (UUID).\n' "$sid1" "$sid2"
+}
+
 cmd_links() {
     require_installed
     # Adds DOMAIN:443 link hosts for XHTTP inbounds created in the panel since
@@ -1265,7 +1297,7 @@ main() {
                 ;;
             -y | --yes) ASSUME_YES=1 ;;
             --purge) PURGE=1 ;;
-            deploy | start | stop | restart | status | links | remove)
+            deploy | start | stop | restart | status | links | genkeys | remove)
                 [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
                 cmd="$1"
                 ;;
