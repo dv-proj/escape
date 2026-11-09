@@ -68,12 +68,12 @@ load_env() {
     done <"$ENV_FILE"
 
     # Defaults mirrored from docker-compose.yml.
-    : "${PANEL_PORT:=2053}" "${XHTTP_PORT:=10000}" "${NGINX_TLS_PORT:=8443}"
+    : "${PANEL_PORT:=2053}" "${SUB_PORT:=2096}" "${XHTTP_PORT:=10000}" "${NGINX_TLS_PORT:=8443}"
     : "${DATA_DIR:=./data}" "${ACME_SERVER:=letsencrypt}"
     : "${XUI_IMAGE:=ghcr.io/mhsanaei/3x-ui:v3.11.0}"
     : "${NGINX_IMAGE:=nginx:1.31.8-alpine}"
     : "${ACME_IMAGE:=neilpang/acme.sh:3.1.6}"
-    export PANEL_PORT XHTTP_PORT NGINX_TLS_PORT DATA_DIR ACME_SERVER XUI_IMAGE NGINX_IMAGE ACME_IMAGE
+    export PANEL_PORT SUB_PORT XHTTP_PORT NGINX_TLS_PORT DATA_DIR ACME_SERVER XUI_IMAGE NGINX_IMAGE ACME_IMAGE
 }
 
 # require_vars VAR...: fail with a clear message if any variable is empty.
