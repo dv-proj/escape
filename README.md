@@ -104,7 +104,7 @@ sudo DOMAIN=app.example.com ACME_EMAIL=me@example.com APP_NAME=Notely \
 | `stop` | root или `vpn` | `docker compose stop` |
 | `restart` | root или `vpn` | stop + start |
 | `status` | root или `vpn` | Состояние контейнеров и сертификата |
-| `links` | root или `vpn` | URL панели, логин/пароль и ссылки клиентов |
+| `links` | root или `vpn` | URL панели, логин/пароль, адрес `/random-<RANDOM_DATA_SUFFIX>`, ссылки клиентов и URL подписок |
 | `remove` | root | Удалить контейнеры и собранные образы |
 | `remove --purge` | root | Дополнительно удалить данные, rootless Docker, пользователя и sysctl-файл |
 

@@ -1054,15 +1054,17 @@ firewall_note() {
 # --- summary ---------------------------------------------------------------------------------------
 
 print_summary() {
-    local envf="$VPN_DIR/.env" domain ppath puser ppass
+    local envf="$VPN_DIR/.env" domain ppath puser ppass rsuffix
     domain="$(env_get "$envf" DOMAIN)"
     ppath="$(env_get "$envf" PANEL_PATH)"
     puser="$(env_get "$envf" PANEL_USERNAME)"
     ppass="$(env_get "$envf" PANEL_PASSWORD)"
+    rsuffix="$(env_get "$envf" RANDOM_DATA_SUFFIX)"
     printf '\n'
     printf 'Panel URL : https://%s/%s/\n' "$domain" "$ppath"
     printf 'Username  : %s\n' "$puser"
     printf 'Password  : %s\n' "$ppass"
+    printf 'Random data (decoy, size 0-500000 bytes): https://%s/random-%s?size=1000\n' "$domain" "$rsuffix"
     printf '\nClient links:\n'
     in_stack scripts/xui.sh links
     printf '\nSubscription URLs (import into a client app; carry all links of a client):\n'
