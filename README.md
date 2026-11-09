@@ -49,7 +49,7 @@ nginx (8443/tcp и 443/udp) маршрутизирует по пути:
 | `acme` | `neilpang/acme.sh` | Выпуск и автопродление Let's Encrypt (HTTP-01) |
 | `fakeapp` | собирается из `fake-webapp/` | Сайт-обманка на Go |
 
-Сайт-обманка (`fakeapp`): `GET /` отдает страницу входа, `POST /login` всегда отвечает 401, а после 3 попыток за минуту для одного логина отвечает 429. `GET /random-data?size=N` возвращает до 500000 случайных байт. Общий лимит 10 запросов в секунду, остальные пути перенаправляются на `/`.
+Сайт-обманка (`fakeapp`): `GET /` отдает страницу входа, `POST /login` всегда отвечает 401, а после 3 попыток за минуту для одного логина отвечает 429. `GET /random-<RANDOM_DATA_SUFFIX>?size=N` возвращает до 500000 случайных байт. Общий лимит 10 запросов в секунду, остальные пути перенаправляются на `/`.
 
 ## 3. Требования
 
@@ -77,7 +77,7 @@ sudo ./vpn.sh deploy
 
 1. Ставит пакеты, создает пользователя `vpn` (по умолчанию), включает lingering, настраивает sysctl `net.ipv4.ip_unprivileged_port_start=80` (`/etc/sysctl.d/99-vpn-rootless.conf`), ставит rootless Docker.
 2. Копирует проект в `~vpn/vpn-stack` (`VPN_DIR`).
-3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`, `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
+3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`, `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
 4. Создает временный самоподписанный сертификат, запускает стек и выпускает сертификат Let's Encrypt.
 5. Настраивает панель и создает входы `reality` и `xhttp`.
 
@@ -146,6 +146,7 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `ACME_EMAIL` | вручную | E-mail для Let's Encrypt |
 | `ACME_SERVER` | по умолчанию | `letsencrypt` или `letsencrypt_test` (staging) |
 | `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` | вручную | Вид сайта-обманки (`Notely`, ...) |
+| `RANDOM_DATA_SUFFIX` | сгенерировано | Суффикс адреса случайных данных сайта-обманки (hex, 8-12 символов) |
 | `TZ` | по умолчанию | Часовой пояс контейнеров (`Europe/Amsterdam`) |
 | `PANEL_PATH` | сгенерировано | Секретный путь панели |
 | `PANEL_USERNAME` | вручную/`admin` | Логин панели |

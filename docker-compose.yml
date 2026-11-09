@@ -142,6 +142,7 @@ services:
       APP_KEYWORDS: ${APP_KEYWORDS:-}
       BASE_URL: https://${DOMAIN:?DOMAIN is required}
       RATE_LIMIT_RPS: "10"
+      RANDOM_DATA_SUFFIX: ${RANDOM_DATA_SUFFIX:?RANDOM_DATA_SUFFIX is required}
       TZ: ${TZ:-UTC}
     tmpfs:
       - /tmp

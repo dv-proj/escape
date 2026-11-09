@@ -24,6 +24,10 @@ func main() {
 	}
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	if err := cfg.validate(); err != nil {
+		slog.Error("invalid config", "err", err)
+		os.Exit(1)
+	}
 	app := NewApp(cfg, time.Now)
 
 	var protos http.Protocols

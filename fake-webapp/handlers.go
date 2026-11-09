@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// MaxRandomDataSize is the maximum number of bytes /random-data may return.
+// MaxRandomDataSize is the maximum number of bytes /random-<suffix> may return.
 const MaxRandomDataSize = 500000
 
 //go:embed templates/*.html
@@ -142,7 +142,7 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 		a.renderPage(w, r, http.StatusOK, "", false)
 	case r.URL.Path == "/login" && r.Method == http.MethodPost:
 		a.login(w, r)
-	case r.URL.Path == "/random-data" && r.Method == http.MethodGet:
+	case r.URL.Path == "/random-"+a.cfg.RandomSuffix && r.Method == http.MethodGet:
 		a.randomData(w, r)
 	default:
 		code := http.StatusFound

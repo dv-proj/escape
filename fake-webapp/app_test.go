@@ -11,13 +11,15 @@ import (
 	"time"
 )
 
+const testSuffix = "0123abcd9f"
+
 type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) Now() time.Time { return c.t }
 
 func newTestApp(rps float64) (*App, *fakeClock, http.Handler) {
 	clk := &fakeClock{t: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
-	cfg := Config{AppName: "Test Portal", Description: "Desc here", Keywords: "k1, k2", BaseURL: "https://example.com", RateLimit: rps}
+	cfg := Config{AppName: "Test Portal", Description: "Desc here", Keywords: "k1, k2", BaseURL: "https://example.com", RateLimit: rps, RandomSuffix: testSuffix}
 	a := NewApp(cfg, clk.Now)
 	return a, clk, a.Handler()
 }
@@ -118,7 +120,7 @@ func TestRandomData(t *testing.T) {
 	_, _, h := newTestApp(1000)
 	for _, n := range []int{0, 1, 500000} {
 		s := strconv.Itoa(n)
-		rec := do(h, "GET", "/random-data?size="+s, nil)
+		rec := do(h, "GET", "/random-"+testSuffix+"?size="+s, nil)
 		if rec.Code != 200 || rec.Body.Len() != n {
 			t.Errorf("size %d: code %d len %d", n, rec.Code, rec.Body.Len())
 		}
@@ -129,11 +131,11 @@ func TestRandomData(t *testing.T) {
 		}
 	}
 	for _, q := range []string{"500001", "-1", "abc", "", "1.5", "+5"} {
-		if rec := do(h, "GET", "/random-data?size="+q, nil); rec.Code != 400 {
+		if rec := do(h, "GET", "/random-"+testSuffix+"?size="+q, nil); rec.Code != 400 {
 			t.Errorf("size %q: %d", q, rec.Code)
 		}
 	}
-	if rec := do(h, "GET", "/random-data", nil); rec.Code != 400 {
+	if rec := do(h, "GET", "/random-"+testSuffix, nil); rec.Code != 400 {
 		t.Errorf("missing: %d", rec.Code)
 	}
 }
@@ -145,7 +147,8 @@ func TestRedirects(t *testing.T) {
 		code int
 	}{
 		{"GET", "/foo", 302}, {"GET", "/login", 302}, {"POST", "/", 303}, {"POST", "/foo", 303},
-		{"GET", "/favicon.ico", 302}, {"PUT", "/random-data", 302}, {"POST", "/random-data", 303},
+		{"GET", "/favicon.ico", 302}, {"PUT", "/random-" + testSuffix, 302}, {"POST", "/random-" + testSuffix, 303},
+		{"GET", "/random-data", 302}, {"GET", "/random-data?size=5", 302}, {"GET", "/random-ffffffff00", 302}, {"GET", "/random-" + testSuffix + "x", 302},
 	}
 	for _, c := range cases {
 		rec := do(h, c.m, c.p, nil)
@@ -169,5 +172,18 @@ func TestGlobalLimiter(t *testing.T) {
 	clk.t = clk.t.Add(time.Second)
 	if rec := do(h, "GET", "/", nil); rec.Code != 200 {
 		t.Fatalf("after refill: %d", rec.Code)
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	for _, v := range []string{"", "short", "0123456", "0123456789abc", "0123ABCD9f", "0123abcg9f"} {
+		if (Config{RandomSuffix: v}).validate() == nil {
+			t.Errorf("%q accepted", v)
+		}
+	}
+	for _, v := range []string{"01234567", "0123456789ab"} {
+		if err := (Config{RandomSuffix: v}).validate(); err != nil {
+			t.Errorf("%q: %v", v, err)
+		}
 	}
 }

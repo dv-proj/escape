@@ -288,6 +288,32 @@ ask() {
     ENV_VALUES[$key]="$value"
 }
 
+# gen_random_data_suffix: lowercase hex, 8-12 chars.
+gen_random_data_suffix() { rand_str $((8 + RANDOM % 5)) '0-9a-f'; }
+
+# ensure_generated_key FILE KEY GENERATOR_FN: append KEY=<generated> to an existing
+# .env when KEY is missing or empty; other lines are left untouched.
+ensure_generated_key() {
+    local file=$1 key=$2 gen=$3 val tmp line found=0
+    [[ -n "$(env_get "$file" "$key")" ]] && return 0
+    val="$("$gen")" || die "cannot generate $key"
+    [[ -n "$val" ]] || die "generator for $key returned nothing"
+    tmp="$(mktemp "$file.XXXXXX")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^${key}=[[:space:]]*$ ]]; then
+            printf '%s=%s\n' "$key" "$(fmt_env_value "$val")" >>"$tmp"
+            found=1
+        else
+            printf '%s\n' "$line" >>"$tmp"
+        fi
+    done <"$file"
+    ((found)) || printf '%s=%s\n' "$key" "$(fmt_env_value "$val")" >>"$tmp"
+    chmod --reference="$file" "$tmp"
+    if [[ $EUID -eq 0 ]]; then chown --reference="$file" "$tmp"; fi
+    mv -f "$tmp" "$file"
+    info "added missing $key to $file"
+}
+
 # gen_secrets: print REALITY_*/CLIENT_UUID lines. Overridden in tests.
 gen_secrets() {
     in_stack scripts/xui.sh genkeys
@@ -329,6 +355,7 @@ generate_env() {
     ENV_VALUES[PANEL_PATH]="$ppath"
     ENV_VALUES[XHTTP_PATH]="$xpath"
     ENV_VALUES[PANEL_PASSWORD]="$(rand_str 28 'A-Za-z0-9')"
+    ENV_VALUES[RANDOM_DATA_SUFFIX]="$(gen_random_data_suffix)"
 
     local keys_out
     keys_out="$(gen_secrets)" || die "key generation failed"
@@ -678,6 +705,7 @@ setup_env() {
     local envf="$VPN_DIR/.env"
     if [[ -f "$envf" ]]; then
         ok "$envf exists; reusing it (no questions asked)"
+        ensure_generated_key "$envf" RANDOM_DATA_SUFFIX gen_random_data_suffix
         return 0
     fi
     [[ -f "$VPN_DIR/.env.example" ]] || die "$VPN_DIR/.env.example is missing"
