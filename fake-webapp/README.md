@@ -11,7 +11,11 @@ Decoy corporate login page served to non-VPN visitors. Plain HTTP and h2c on `LI
 | `APP_DESCRIPTION` | neutral sentence | meta description |
 | `APP_KEYWORDS` | neutral keywords | meta keywords |
 | `BASE_URL` | empty | canonical link and `og:url` (e.g. `https://example.com`) |
-| `RATE_LIMIT_RPS` | `10` | global token bucket (burst = RPS), excess gets 429 |
+| `RATE_LIMIT_RPS` | required, 1-1000 | per-client-IP token bucket rate (IP from `X-Real-IP`); excess gets an HTML 429 with `Retry-After` |
+| `RATE_LIMIT_BURST` | required, 1-1000 | per-client-IP burst |
+| `RATE_LIMIT_GLOBAL_RPS` | required, 1-100000 | global ceiling for all clients |
+| `LOGIN_DELAY_MIN_MS` / `LOGIN_DELAY_MAX_MS` | required, 0 <= min <= max <= 10000 | `POST /login` waits a random log-normal time in this range before answering |
+| `FAVICON_FILE` | `/data/favicon.ico` | replaces the built-in blank favicon if the file exists (read at start, max 1 MiB) |
 | `RANDOM_DATA_SUFFIX` | required | lowercase hex, 8-12 chars; the data endpoint is `/random-<suffix>`; the app exits at startup if missing or invalid |
 | `PAGE_SEED` | required | 16-64 lowercase hex chars; seed of the generated login page variant; the app exits at startup if missing or invalid |
 | `PAGE_FILE` | `/data/page.html` | the page template (Go `html/template`); empty string disables the file (memory only) |
@@ -30,9 +34,12 @@ Template data: `AppName`, `Description`, `Keywords`, `BaseURL`, `JSONLD`, `Nonce
 ## Endpoints
 
 - `GET /` (and HEAD): login page with SEO metadata and server time.
-- `POST /login`: always 401; the 3rd attempt for the same username (case-insensitive) within 60s gets 429 + `Retry-After`.
-- `GET /random-<RANDOM_DATA_SUFFIX>?size=N`: N random bytes, 0 <= N <= 500000, else 400.
-- Anything else: 302 to `/` (303 for POST).
+- `GET /favicon.ico` (and HEAD): blank 16x16 icon (or `FAVICON_FILE`), `Cache-Control: public, max-age=86400`, ETag.
+- `POST /login`: delayed (see above), always 401; the 3rd attempt for the same username (case-insensitive) within 60s gets 429 + `Retry-After`.
+- `GET /random-<RANDOM_DATA_SUFFIX>?size=N`: N random bytes, 0 <= N <= 500000, else 400 (HTML body).
+- Anything else (incl. `/robots.txt`, `/sitemap.xml`): 302 to `/` (303 for POST) with an empty body.
+
+No Go plain-text bodies are sent: 429 and 400 are small HTML pages (wording from `PAGE_SEED`, `errorpage.go`). Security headers (`headers.go`: CSP directive set/order, nonce length and encoding, `Referrer-Policy`, `X-Frame-Options`, `Permissions-Policy`, COOP, `Cache-Control` of the page) are derived deterministically from `PAGE_SEED`.
 
 Healthcheck: `fake-webapp -healthcheck` (GET `/` on localhost, exit 0 on 200).
 

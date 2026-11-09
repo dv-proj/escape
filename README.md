@@ -77,11 +77,11 @@ sudo ./vpn.sh deploy
 
 1. Ставит пакеты, создает пользователя `vpn` (по умолчанию), включает lingering, настраивает sysctl `net.ipv4.ip_unprivileged_port_start=80` (`/etc/sysctl.d/99-vpn-rootless.conf`), ставит rootless Docker.
 2. Копирует проект в `~vpn/vpn-stack` (`VPN_DIR`).
-3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`, `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, `PAGE_SEED`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
+3. Создает `.env`, если его нет. Спрашивает `DOMAIN`, `ACME_EMAIL`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` (по умолчанию предлагается случайный правдоподобный набор, Enter принимает его), `PANEL_USERNAME`. Генерирует `PANEL_PATH`, `XHTTP_PATH`, `PANEL_PASSWORD`, `RANDOM_DATA_SUFFIX`, `PAGE_SEED`, `RATE_LIMIT_*`, `LOGIN_DELAY_*`, ключи REALITY, `REALITY_SHORT_ID` и `CLIENT_UUID`.
 4. Создает временный самоподписанный сертификат, запускает стек и выпускает сертификат Let's Encrypt.
 5. Настраивает панель и создает входы `reality` и `xhttp`.
 
-В конце выводятся URL панели, логин, пароль и три ссылки `vless://`. Повторный запуск обновляет файлы и перезапускает стек, секреты не пересоздаются. Существующий `$VPN_DIR/.env` используется как есть, вопросов нет.
+В конце выводятся URL панели, логин, пароль и три ссылки `vless://`. Повторный запуск обновляет файлы и перезапускает стек, секреты не пересоздаются. Существующий `$VPN_DIR/.env` используется: значения не меняются и вопросов нет, но ключи, которых в нем не хватает по сравнению с `.env.example`, дописываются в конец вместе с комментариями-описаниями (сгенерированное значение или значение по умолчанию; для каждого добавленного ключа выводится строка в лог). Пустые сгенерированные ключи заполняются на месте. Порядок, комментарии, пользовательские значения и лишние ключи не трогаются, повторный запуск ничего не меняет. `.env.example` - единственный источник описаний: у каждого ключа в нем есть комментарий.
 
 Неинтерактивный режим:
 
@@ -145,10 +145,14 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 | `DOMAIN` | вручную | Публичный домен |
 | `ACME_EMAIL` | вручную | E-mail для Let's Encrypt |
 | `ACME_SERVER` | по умолчанию | `letsencrypt` или `letsencrypt_test` (staging) |
-| `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` | вручную | Вид сайта-обманки (`Notely`, ...) |
+| `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` | сгенерировано | Вид сайта-обманки. Если не заданы, `vpn.sh` подбирает согласованный случайный набор (название, описание, ключевые слова) из встроенных пулов; в интерактивном режиме он предлагается как значение по умолчанию. Значений из примера нет |
 | `RANDOM_DATA_SUFFIX` | сгенерировано | Суффикс адреса случайных данных сайта-обманки (hex, 8-12 символов) |
 | `PAGE_SEED` | сгенерировано | Seed страницы-приманки (32 hex-символа); из него один раз генерируется `data/fakeapp/page.html` |
-| `TZ` | по умолчанию | Часовой пояс контейнеров (`Europe/Amsterdam`) |
+| `RATE_LIMIT_RPS` | сгенерировано | Лимит запросов/с на один IP клиента (из `X-Real-IP`), случайно 8-15 |
+| `RATE_LIMIT_BURST` | сгенерировано | Всплеск на один IP, случайно 15-40 |
+| `RATE_LIMIT_GLOBAL_RPS` | сгенерировано | Общий потолок для всех клиентов, случайно 150-400 |
+| `LOGIN_DELAY_MIN_MS`, `LOGIN_DELAY_MAX_MS` | сгенерировано | Диапазон случайной задержки ответа `POST /login`: минимум 180-400 мс, максимум = минимум + 300-900 мс |
+| `TZ` | сгенерировано | Часовой пояс контейнеров; берется с хоста при развертывании (иначе `UTC`) |
 | `PANEL_PATH` | сгенерировано | Секретный путь панели |
 | `PANEL_USERNAME` | вручную/`admin` | Логин панели |
 | `PANEL_PASSWORD` | сгенерировано | Пароль панели |
@@ -187,6 +191,10 @@ scripts/xui.sh genkeys       # напечатать новые ключи (ни�
 - Если файл не разбирается как шаблон, в логе `fakeapp` будет ошибка, а страница отдается сгенерированная (файл не перезаписывается).
 - Чтобы заново сгенерировать страницу из `PAGE_SEED`, удалите файл (`docker run --rm -v "$PWD/data/fakeapp:/d" --entrypoint rm $IMG -f /d/page.html`) и выполните `docker compose restart fakeapp`.
 - Для другого варианта измените `PAGE_SEED` в `.env` (любые 16-64 символа `0-9a-f`), удалите файл и выполните `vpn.sh restart`.
+- Лимиты: вместо общего rate-limiter 10 RPS из ТЗ по просьбе заказчика сделан лимит на каждый IP (token bucket, `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`) плюс общий потолок `RATE_LIMIT_GLOBAL_RPS`, чтобы один клиент не мог «выключить» сайт для всех. Превышение дает 429 со страницей в том же стиле и `Retry-After`.
+- Задержка входа: `POST /login` отвечает (401 и 429) не сразу, а через случайное время из диапазона `LOGIN_DELAY_MIN_MS`..`LOGIN_DELAY_MAX_MS` (логнормальное распределение, не равномерное).
+- Заголовки (CSP, `Referrer-Policy`, nonce, `Permissions-Policy`, `Cache-Control` и т. п.) различаются между развертываниями и детерминированно выводятся из `PAGE_SEED`.
+- Favicon: `/favicon.ico` отдает встроенную пустую прозрачную иконку 16x16. Чтобы заменить ее, положите свой файл как `$VPN_DIR/data/fakeapp/favicon.ico` (тем же способом, что и `page.html`, через одноразовый контейнер: `docker run --rm -i --network none -v "$PWD/data/fakeapp:/d" --entrypoint /bin/sh $IMG -c 'cat > /d/favicon.ico' < favicon.ico`) и выполните `docker compose restart fakeapp` (файл читается при старте; до 1 МБ). `/robots.txt` и `/sitemap.xml` по-прежнему перенаправляют на `/`.
 - Данные шаблона: `.AppName`, `.Description`, `.Keywords`, `.BaseURL`, `.JSONLD`, `.Nonce` (обязателен в `<style>`/`<script>` из-за CSP), `.Time`, `.UnixMilli`, `.OffsetSec`, `.Year`, `.HideForm` и `.State` (`""`, `"invalid"` для 401, `"throttled"` для 429). Поля формы `username`/`password` и `action="/login"` менять не нужно.
 
 ## 7. Варианты использования

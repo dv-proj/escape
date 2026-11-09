@@ -141,12 +141,18 @@ services:
       APP_DESCRIPTION: ${APP_DESCRIPTION:-}
       APP_KEYWORDS: ${APP_KEYWORDS:-}
       BASE_URL: https://${DOMAIN:?DOMAIN is required}
-      RATE_LIMIT_RPS: "10"
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:?RATE_LIMIT_RPS is required}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:?RATE_LIMIT_BURST is required}
+      RATE_LIMIT_GLOBAL_RPS: ${RATE_LIMIT_GLOBAL_RPS:?RATE_LIMIT_GLOBAL_RPS is required}
+      LOGIN_DELAY_MIN_MS: ${LOGIN_DELAY_MIN_MS:?LOGIN_DELAY_MIN_MS is required}
+      LOGIN_DELAY_MAX_MS: ${LOGIN_DELAY_MAX_MS:?LOGIN_DELAY_MAX_MS is required}
+      FAVICON_FILE: /data/favicon.ico
       RANDOM_DATA_SUFFIX: ${RANDOM_DATA_SUFFIX:?RANDOM_DATA_SUFFIX is required}
       PAGE_SEED: ${PAGE_SEED:?PAGE_SEED is required}
       TZ: ${TZ:-UTC}
     volumes:
-      # Decoy page (page.html), generated on first start and editable by hand.
+      # Decoy page (page.html), generated on first start and editable by hand;
+      # an optional favicon.ico placed here replaces the built-in blank one.
       - ${DATA_DIR:-./data}/fakeapp:/data
     tmpfs:
       - /tmp
