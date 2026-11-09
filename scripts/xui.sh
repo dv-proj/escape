@@ -63,6 +63,7 @@ validate_common() {
     [[ -z "${REALITY_SHORT_ID:-}" ]] || validate REALITY_SHORT_ID '^([0-9a-f]{2}){1,8}$' "1-8 bytes of lowercase hex (2-16 chars)"
     [[ -z "${XHTTP_PATH:-}" ]] || validate XHTTP_PATH '^[A-Za-z0-9._~-]+$' "a single URL path segment without slashes"
     [[ -z "${PANEL_PATH:-}" ]] || validate PANEL_PATH '^[A-Za-z0-9._~-]+$' "a single URL path segment without slashes"
+    [[ -z "${REALITY_MAX_TIME_DIFF_MS:-}" ]] || validate REALITY_MAX_TIME_DIFF_MS '^[0-9]{1,9}$' "a non-negative integer in milliseconds (0 disables the check)"
     validate PANEL_PORT '^[0-9]{1,5}$' "a port number"
     validate XHTTP_PORT '^[0-9]{1,5}$' "a port number"
     validate NGINX_TLS_PORT '^[0-9]{1,5}$' "a port number"
@@ -214,7 +215,7 @@ reality_inbound() {
     settings="{\"clients\":[$(client_json "client-reality" "xtls-rprx-vision")],\"decryption\":\"none\",\"encryption\":\"none\",\"fallbacks\":[]}"
     # target = nginx TLS listener; xver 1 = PROXY protocol v1 (matches
     # `listen ... proxy_protocol` in nginx, which auto-detects v1/v2).
-    stream="{\"network\":\"tcp\",\"security\":\"reality\",\"externalProxy\":[],\"realitySettings\":{\"show\":false,\"xver\":1,\"target\":$(json_str "nginx:$NGINX_TLS_PORT"),\"serverNames\":[$(json_str "$DOMAIN")],\"privateKey\":$(json_str "$REALITY_PRIVATE_KEY"),\"minClientVer\":\"\",\"maxClientVer\":\"\",\"maxTimediff\":0,\"shortIds\":[$(json_str "$REALITY_SHORT_ID")],\"settings\":{\"publicKey\":$(json_str "$REALITY_PUBLIC_KEY"),\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
+    stream="{\"network\":\"tcp\",\"security\":\"reality\",\"externalProxy\":[],\"realitySettings\":{\"show\":false,\"xver\":1,\"target\":$(json_str "nginx:$NGINX_TLS_PORT"),\"serverNames\":[$(json_str "$DOMAIN")],\"privateKey\":$(json_str "$REALITY_PRIVATE_KEY"),\"minClientVer\":\"\",\"maxClientVer\":\"\",\"maxTimediff\":${REALITY_MAX_TIME_DIFF_MS:-0},\"shortIds\":[$(json_str "$REALITY_SHORT_ID")],\"settings\":{\"publicKey\":$(json_str "$REALITY_PUBLIC_KEY"),\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
     inbound_json "$REALITY_REMARK" 443 "$settings" "$stream"
 }
 

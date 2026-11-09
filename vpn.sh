@@ -215,6 +215,34 @@ valid_domain() {
     [[ "$1" =~ $re && ${#1} -le 253 ]] || return 1
     [[ "${1,,}" != example.com && "${1,,}" != *.example.com ]]
 }
+# domain_suspicious_token DOMAIN: print the first label token (labels split by
+# '.' and '-', case-insensitive, whole tokens only) that hints at a VPN/proxy.
+domain_suspicious_token() {
+    local -a toks
+    local t w
+    IFS='.-' read -r -a toks <<<"${1,,}"
+    for t in "${toks[@]}"; do
+        for w in vpn proxy xray v2ray vless vmess trojan reality tunnel wg wireguard socks shadowsocks ss outline xui panel; do
+            if [[ "$t" == "$w" ]]; then
+                printf '%s' "$t"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# warn_suspicious_domain DOMAIN: warn about telltale words and ask to continue
+# (--yes accepts; without a terminal only the warning is printed).
+warn_suspicious_domain() {
+    local tok
+    tok="$(domain_suspicious_token "$1")" || return 0
+    warn "domain '$1' contains the word '$tok': the name is visible in SNI and certificate transparency logs and is an easy keyword for filters. A neutral name (e.g. app.example.com) is recommended."
+    if ((ASSUME_YES)) || [[ -t 0 ]]; then
+        confirm "Continue with this domain?" || die "aborted: choose a more neutral domain name"
+    fi
+    return 0
+}
 valid_email() {
     local re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
     [[ "$1" =~ $re ]] || return 1
@@ -304,6 +332,17 @@ rand_int() { printf '%s' "$(($1 + RANDOM % ($2 - $1 + 1)))"; }
 gen_rate_limit_rps() { rand_int 8 15; }
 gen_rate_limit_burst() { rand_int 15 40; }
 gen_rate_limit_global_rps() { rand_int 150 400; }
+gen_nginx_client_header_timeout() { rand_int 20 60; }
+gen_nginx_keepalive_timeout() { rand_int 45 90; }
+gen_nginx_hsts_max_age() {
+    local -a v=(15552000 31536000 63072000)
+    printf '%s' "${v[RANDOM % ${#v[@]}]}"
+}
+gen_nginx_altsvc_max_age() {
+    local -a v=(3600 86400 604800 2592000)
+    printf '%s' "${v[RANDOM % ${#v[@]}]}"
+}
+gen_reality_max_time_diff() { rand_int 60000 120000; }
 gen_login_delay_min() { rand_int 180 400; }
 # gen_login_delay_max [ENVFILE]: min + 300..900 (min is read from ENVFILE if set there).
 gen_login_delay_max() {
@@ -435,6 +474,11 @@ generator_for() {
         RATE_LIMIT_GLOBAL_RPS) echo gen_rate_limit_global_rps ;;
         LOGIN_DELAY_MIN_MS) echo gen_login_delay_min ;;
         LOGIN_DELAY_MAX_MS) echo gen_login_delay_max ;;
+        NGINX_CLIENT_HEADER_TIMEOUT) echo gen_nginx_client_header_timeout ;;
+        NGINX_KEEPALIVE_TIMEOUT) echo gen_nginx_keepalive_timeout ;;
+        NGINX_HSTS_MAX_AGE) echo gen_nginx_hsts_max_age ;;
+        NGINX_ALTSVC_MAX_AGE) echo gen_nginx_altsvc_max_age ;;
+        REALITY_MAX_TIME_DIFF_MS) echo gen_reality_max_time_diff ;;
         PANEL_PATH) echo gen_panel_path ;;
         XHTTP_PATH) echo gen_xhttp_path ;;
         PANEL_PASSWORD) echo gen_panel_password ;;
@@ -537,7 +581,7 @@ sync_env_with_example() {
             val="$def"
         else
             case "$key" in
-                DOMAIN) ask DOMAIN "Domain name (A record must point to this server)" "" valid_domain "a fully qualified domain name (not example.com)"; val="${ENV_VALUES[DOMAIN],,}" ;;
+                DOMAIN) ask DOMAIN "Domain name (A record must point to this server)" "" valid_domain "a fully qualified domain name (not example.com)"; val="${ENV_VALUES[DOMAIN],,}"; warn_suspicious_domain "$val" ;;
                 ACME_EMAIL) ask ACME_EMAIL "E-mail for Let's Encrypt" "" valid_email "an e-mail address (not @example.com)"; val="${ENV_VALUES[ACME_EMAIL]}" ;;
                 *) die "$key is missing in $envf and has no default; add it manually" ;;
             esac
@@ -570,6 +614,7 @@ generate_env() {
     gen_app_trio
     ask DOMAIN "Domain name (A record must point to this server)" "" valid_domain "a fully qualified domain name (not example.com)"
     ENV_VALUES[DOMAIN]="${ENV_VALUES[DOMAIN],,}"
+    warn_suspicious_domain "${ENV_VALUES[DOMAIN]}"
     ask ACME_EMAIL "E-mail for Let's Encrypt" "" valid_email "an e-mail address (not @example.com)"
     ask APP_NAME "Decoy site name" "$GEN_APP_NAME" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_DESCRIPTION "Decoy site description" "$GEN_APP_DESCRIPTION" valid_text "1-200 characters without ' \" \$ \` \\"
@@ -599,6 +644,11 @@ generate_env() {
     ENV_VALUES[RATE_LIMIT_GLOBAL_RPS]="$(gen_rate_limit_global_rps)"
     ENV_VALUES[LOGIN_DELAY_MIN_MS]="$(gen_login_delay_min)"
     ENV_VALUES[LOGIN_DELAY_MAX_MS]=$((ENV_VALUES[LOGIN_DELAY_MIN_MS] + $(rand_int 300 900)))
+    ENV_VALUES[NGINX_CLIENT_HEADER_TIMEOUT]="$(gen_nginx_client_header_timeout)"
+    ENV_VALUES[NGINX_KEEPALIVE_TIMEOUT]="$(gen_nginx_keepalive_timeout)"
+    ENV_VALUES[NGINX_HSTS_MAX_AGE]="$(gen_nginx_hsts_max_age)"
+    ENV_VALUES[NGINX_ALTSVC_MAX_AGE]="$(gen_nginx_altsvc_max_age)"
+    ENV_VALUES[REALITY_MAX_TIME_DIFF_MS]="$(gen_reality_max_time_diff)"
 
     local keys_out
     keys_out="$(gen_secrets)" || die "key generation failed"
