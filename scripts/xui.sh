@@ -31,6 +31,11 @@ Commands:
                    (port matching XHTTP_ROUTE_PORT_RE, path
                    /XHTTP_PATH-<port>/, security none) that have no host
                    yet; their existing hosts are never changed. Idempotent.
+  auto-hosts       Like configure-hosts, but only adds missing hosts (never
+                   changes existing ones), prints nothing when there is
+                   nothing to do and does nothing while xui is not running.
+                   Run every minute by the vpn-hosts.timer user unit
+                   (installed by vpn.sh deploy).
   configure-sub    Apply the subscription settings through the panel API
                    (enabled, port SUB_PORT, path /SUB_PATH/, public URL
                    https://DOMAIN/SUB_PATH/, no TLS on the sub server: nginx
@@ -53,6 +58,7 @@ Environment (.env at the repo root, or ENV_FILE=path):
                    [NGINX_TLS_PORT=8443] [PANEL_PORT=2053]
   configure-hosts  DOMAIN XHTTP_PATH [PANEL_PORT=2053] [PANEL_PATH]
                    [XHTTP_ROUTE_PORT_RE=1[0-9]{4}]
+  auto-hosts       same as configure-hosts
   configure-sub    DOMAIN SUB_PATH [SUB_PORT=2096] [PANEL_PORT=2053] [PANEL_PATH]
   sub-links        DOMAIN SUB_PATH [PANEL_PORT=2053] [PANEL_PATH]
   links            DOMAIN CLIENT_UUID REALITY_PUBLIC_KEY REALITY_SHORT_ID
@@ -75,7 +81,13 @@ XHTTP_H2_HOST_REMARK=h2
 XHTTP_H3_HOST_REMARK=h3
 # Token name used for API access during provisioning; rotated (invalidated)
 # again when provisioning finishes.
-API_TOKEN_NAME=vpn-provision
+# XUI_API_TOKEN_NAME lets concurrent callers (the auto-hosts timer) use their
+# own token, so one run never invalidates the token of another.
+API_TOKEN_NAME="${XUI_API_TOKEN_NAME:-vpn-provision}"
+[[ "$API_TOKEN_NAME" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || {
+    printf 'error: invalid XUI_API_TOKEN_NAME\n' >&2
+    exit 1
+}
 XHTTP_MODE=auto
 
 # --- validation -------------------------------------------------------------------
@@ -449,6 +461,8 @@ apply_hosts() {
         die "could not compute the host changes"
     while IFS=$'\t' read -r action a b; do
         [[ -n "$action" ]] || continue
+        # Add-only mode (auto-hosts): hosts the user edited are never reverted.
+        [[ "$action" != update || -z "${HOSTS_ADD_ONLY:-}" ]] || continue
         case "$action" in
             add) resp="$(api POST hosts/add "$a")" || die "API request hosts/add failed" ;;
             update) resp="$(api POST "hosts/update/$a" "$b")" || die "API request hosts/update failed" ;;
@@ -457,7 +471,22 @@ apply_hosts() {
         api_ok "$resp" || die "host $action failed: $(api_msg "$resp") (response: ${resp:0:200})"
         n=$((n + 1))
     done <<<"$plan"
-    if ((n)); then log "hosts configured ($n changed)"; else log "hosts already up to date"; fi
+    if ((n)); then
+        log "hosts configured ($n changed)"
+    elif [[ -z "${HOSTS_ADD_ONLY:-}" ]]; then
+        log "hosts already up to date"
+    fi
+}
+
+# auto-hosts: run by the vpn-hosts.timer user unit every minute. Adds missing
+# hosts only (never updates existing ones), silent when nothing changes and
+# when the stack is not running.
+cmd_auto_hosts() {
+    require_vars DOMAIN XHTTP_PATH
+    service_running xui || return 0
+    HOSTS_ADD_ONLY=1
+    api_session_start
+    apply_hosts
 }
 
 cmd_configure_hosts() {
@@ -581,7 +610,7 @@ main() {
             : "${XUI_IMAGE:=ghcr.io/mhsanaei/3x-ui:v3.11.0}"
             cmd_genkeys
             ;;
-        configure-panel | provision | configure-hosts | configure-sub | sub-links)
+        configure-panel | provision | configure-hosts | auto-hosts | configure-sub | sub-links)
             need_cmd docker od
             load_env
             validate_common
