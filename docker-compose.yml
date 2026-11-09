@@ -85,9 +85,8 @@ services:
       SUB_PORT: ${SUB_PORT:-2096}
       XHTTP_PATH: ${XHTTP_PATH:?XHTTP_PATH is required}
       XHTTP_PORT: ${XHTTP_PORT:-10000}
-      # Port range of additional XHTTP inbounds (/XHTTP_PATH-<port>/ -> xui:<port>).
-      XHTTP_ROUTE_PORT_MIN: ${XHTTP_ROUTE_PORT_MIN:-10000}
-      XHTTP_ROUTE_PORT_MAX: ${XHTTP_ROUTE_PORT_MAX:-19999}
+      # Ports of additional XHTTP inbounds (/XHTTP_PATH-<port>/ -> xui:<port>).
+      XHTTP_ROUTE_PORT_RE: ${XHTTP_ROUTE_PORT_RE:-1[0-9]{4}}
       NGINX_TLS_PORT: ${NGINX_TLS_PORT:-8443}
       DOCKER_SUBNET: ${DOCKER_SUBNET:-172.30.53.0/24}
       NGINX_CLIENT_HEADER_TIMEOUT: ${NGINX_CLIENT_HEADER_TIMEOUT:-60}
@@ -104,7 +103,7 @@ services:
       - "443:443/udp"
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
-      # Builds XHTTP_ROUTE_PORT_RE / XHTTP_PATH_RE for the templates.
+      # Checks XHTTP_ROUTE_PORT_RE, builds XHTTP_PATH_RE for the templates.
       - ./nginx/docker-entrypoint.d/15-xhttp-route.envsh:/docker-entrypoint.d/15-xhttp-route.envsh:ro
       - ./nginx/docker-entrypoint.d/40-cert-reload.sh:/docker-entrypoint.d/40-cert-reload.sh:ro
       - ${DATA_DIR:-./data}/certs:/etc/nginx/certs:ro
