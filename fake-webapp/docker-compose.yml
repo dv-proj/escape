@@ -28,7 +28,8 @@ services:
       APP_NAME: ${APP_NAME:?APP_NAME is required}
       APP_DESCRIPTION: ${APP_DESCRIPTION:-}
       APP_KEYWORDS: ${APP_KEYWORDS:-}
-      BASE_URL: ${BASE_URL:-}
+      # https://<DOMAIN>, or empty when DOMAIN is not set.
+      BASE_URL: ${DOMAIN:+https://${DOMAIN}}
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:?RATE_LIMIT_RPS is required}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:?RATE_LIMIT_BURST is required}
       RATE_LIMIT_GLOBAL_RPS: ${RATE_LIMIT_GLOBAL_RPS:?RATE_LIMIT_GLOBAL_RPS is required}

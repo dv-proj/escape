@@ -180,25 +180,35 @@ func TestThrottleEvictionBound(t *testing.T) {
 
 func TestRandomData(t *testing.T) {
 	_, _, h := newTestApp(1000)
-	for _, n := range []int{0, 1, 500000} {
+	check := func(name string, rec *httptest.ResponseRecorder, n int) {
+		t.Helper()
 		s := strconv.Itoa(n)
-		rec := do(h, "GET", "/random-"+testSuffix+"?size="+s, nil)
 		if rec.Code != 200 || rec.Body.Len() != n {
-			t.Errorf("size %d: code %d len %d", n, rec.Code, rec.Body.Len())
+			t.Errorf("%s: code %d len %d, want 200 len %d", name, rec.Code, rec.Body.Len(), n)
 		}
 		if rec.Header().Get("Content-Type") != "application/octet-stream" || rec.Header().Get("Cache-Control") != "no-store" ||
 			!strings.Contains(rec.Header().Get("Content-Disposition"), "data-"+s+".bin") ||
 			rec.Header().Get("Content-Length") != s {
-			t.Errorf("size %d: bad headers %v", n, rec.Header())
+			t.Errorf("%s: bad headers %v", name, rec.Header())
 		}
 	}
-	for _, q := range []string{"500001", "-1", "abc", "", "1.5", "+5"} {
-		if rec := do(h, "GET", "/random-"+testSuffix+"?size="+q, nil); rec.Code != 400 {
-			t.Errorf("size %q: %d", q, rec.Code)
-		}
+	// Explicit size: exactly that many bytes.
+	for _, n := range []int{0, 1, MaxRandomDataSize} {
+		check("size "+strconv.Itoa(n), do(h, "GET", "/random-"+testSuffix+"?size="+strconv.Itoa(n), nil), n)
 	}
-	if rec := do(h, "GET", "/random-"+testSuffix, nil); rec.Code != 400 {
-		t.Errorf("missing: %d", rec.Code)
+	// No size, or an unusable one: a random size in [50000, MaxRandomDataSize).
+	random := func(name, target string) {
+		t.Helper()
+		rec := do(h, "GET", target, nil)
+		n := rec.Body.Len()
+		if n < 50_000 || n >= MaxRandomDataSize {
+			t.Errorf("%s: random size %d out of range", name, n)
+		}
+		check(name, rec, n)
+	}
+	random("no query", "/random-"+testSuffix)
+	for _, q := range []string{"", "500001", "-1", "abc", "1.5", "+5"} {
+		random("size "+strconv.Quote(q), "/random-"+testSuffix+"?size="+q)
 	}
 }
 
@@ -478,11 +488,22 @@ func TestLoginDelayContextCancel(t *testing.T) {
 	}
 }
 
+// TestPlainTextBodiesGone: no Go default plain-text bodies; responses are
+// HTML pages, binary data or empty redirects.
 func TestPlainTextBodiesGone(t *testing.T) {
-	_, _, h := newTestApp(0)
-	rec := do(h, "GET", "/random-"+testSuffix+"?size=abc", nil)
-	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "<html") || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
-		t.Errorf("400: %d %q", rec.Code, rec.Body.String())
+	_, _, h := newTestApp(1000)
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/random-" + testSuffix + "?size=abc"},
+		{"GET", "/random-" + testSuffix},
+		{"GET", "/nope"},
+		{"POST", "/nope"},
+		{"GET", "/random-" + testSuffix + "x"},
+	} {
+		rec := do(h, c.method, c.path, nil)
+		ct := rec.Header().Get("Content-Type")
+		if strings.HasPrefix(ct, "text/plain") || (rec.Body.Len() > 0 && ct == "") {
+			t.Errorf("%s %s: %d %q body %q", c.method, c.path, rec.Code, ct, rec.Body.String())
+		}
 	}
 }
 

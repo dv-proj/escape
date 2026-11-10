@@ -10,7 +10,7 @@ Decoy corporate login page served to non-VPN visitors. Plain HTTP and h2c on `LI
 | `APP_NAME` | `Cloud Portal` | name shown on page and in `<title>` |
 | `APP_DESCRIPTION` | neutral sentence | meta description |
 | `APP_KEYWORDS` | neutral keywords | meta keywords |
-| `BASE_URL` | empty | canonical link and `og:url` (e.g. `https://example.com`) |
+| `BASE_URL` | empty | canonical link and `og:url` (e.g. `https://example.com`); the compose file sets it to `https://<DOMAIN>` when `DOMAIN` is set in `.env` |
 | `RATE_LIMIT_RPS` | required, 1-1000 | per-client-IP token bucket rate (IP from `X-Real-IP`); excess gets an HTML 429 with `Retry-After` |
 | `RATE_LIMIT_BURST` | required, 1-1000 | per-client-IP burst |
 | `RATE_LIMIT_GLOBAL_RPS` | required, 1-100000 | global ceiling for all clients |
@@ -36,7 +36,7 @@ Template data: `AppName`, `Description`, `Keywords`, `BaseURL`, `JSONLD`, `Nonce
 
 - `GET /` (and HEAD): login page with SEO metadata and server time.
 - `POST /login`: delayed (see above), always 401; the 3rd attempt for the same username (case-insensitive) within 60s gets 429 + `Retry-After`.
-- `GET /random-<RANDOM_DATA_SUFFIX>?size=N`: N random bytes, 0 <= N <= 500000, else 400 (HTML body).
+- `GET /random-<RANDOM_DATA_SUFFIX>?size=N`: N random bytes for 0 <= N <= 500000; without `size` or with an invalid one, a random size between 50000 and 500000.
 - `GET`/`HEAD` of a file in `STATIC_DIR` (e.g. `/favicon.ico`, `/a/b/c.css`), read on every request so edits show immediately: `Last-Modified`/`If-Modified-Since`/`Range` via `http.ServeContent`, `ETag` (size + mtime), `Cache-Control: no-cache`, `Content-Type` from the extension (else `application/octet-stream`), `X-Content-Type-Options: nosniff`, and the same security headers as the page. Files are opened through `os.OpenRoot`, so `..` and symlinks cannot leave the directory. Not served (redirect below): path segments starting with `.`, `/login.html` (any case), directories (no listing, no index), non-regular files, unclean paths.
 - Routing precedence: `/`, `POST /login`, `/random-<suffix>`, static files, then the redirect.
 - Anything else (incl. `/robots.txt`, `/sitemap.xml`): 302 to `/` (303 for POST) with an empty body.

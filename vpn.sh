@@ -57,6 +57,9 @@ step() {
 
 on_err() {
     local code=$? line=$1 cmd=$2
+    # ERR is inherited by subshells (set -E): report only in the main shell,
+    # which fires again when the subshell fails.
+    [[ "$BASHPID" == "$$" ]] || return "$code"
     trap - ERR
     printf '\n%serror:%s step "%s" failed (exit %d) at vpn.sh line %s: %s\n' \
         "$C_RED" "$C_RESET" "$CURRENT_STEP" "$code" "$line" "$cmd" >&2
@@ -93,7 +96,7 @@ Options:
   -h, --help  Show this help.
 
 Environment:
-  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, BASE_URL
+  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, DOMAIN
               If set when .env is created by `install`, they are used without
               prompting. Unset APP_* values are generated at random (offered
               as defaults when interactive). Without a terminal, all other
@@ -221,11 +224,6 @@ valid_text() {
     [[ ! "$1" =~ [\'\"\$\`\\[:cntrl:]] ]]
 }
 valid_tz() { [[ "$1" =~ ^[A-Za-z0-9_+/-]{1,64}$ ]]; }
-# Empty, or http(s)://host[:port] without a trailing slash.
-valid_base_url() {
-    [[ -z "$1" ]] && return 0
-    [[ "$1" =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$ ]]
-}
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (($1 >= 1 && $1 <= 65535)); }
 
 # rand_str LENGTH CHARSET: random string from /dev/urandom.
@@ -290,29 +288,24 @@ ask() {
     ENV_VALUES[$key]="$value"
 }
 
-# ask_base_url: optional BASE_URL into ENV_VALUES[BASE_URL]. From the
-# environment if set; else asked when interactive (empty allowed); else empty.
-ask_base_url() {
+# ask_domain: optional DOMAIN (DNS name or IP address, not checked) into
+# ENV_VALUES[DOMAIN]. From the environment if set; else asked when
+# interactive (empty allowed); else empty. Surrounding spaces are trimmed.
+ask_domain() {
     local v=""
-    if [[ -n "${BASE_URL:-}" ]]; then
-        v="$BASE_URL"
-        valid_base_url "$v" || die "BASE_URL from the environment is invalid: expected http(s)://host[:port]"
-        info "BASE_URL (from environment): $v"
+    if [[ -n "${DOMAIN:-}" ]]; then
+        v="$DOMAIN"
     elif [[ -t 0 ]]; then
-        while :; do
-            read -r -p "Public URL of the site, e.g. https://app.example.com (empty: none): " v || die "no input"
-            v="${v#"${v%%[![:space:]]*}"}"
-            v="${v%"${v##*[![:space:]]}"}"
-            v="${v%/}"
-            valid_base_url "$v" && break
-            warn "invalid value; expected http(s)://host[:port] or empty"
-        done
+        read -r -p "DNS name of the site, e.g. app.example.com (empty: none): " v || die "no input"
     fi
-    ENV_VALUES[BASE_URL]="$v"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ -z "${DOMAIN:-}" ]] || info "DOMAIN (from environment): $v"
+    ENV_VALUES[DOMAIN]="$v"
 }
 
 # Keys of .env.example that may stay empty.
-is_optional_key() { [[ "$1" == BASE_URL ]]; }
+is_optional_key() { [[ "$1" == DOMAIN ]]; }
 
 # --- generated values -------------------------------------------------------------------
 
@@ -480,9 +473,9 @@ sync_env_with_example() {
             val="$("$gen" "$envf")" || die "cannot generate $key"
         elif [[ -n "$def" ]]; then
             val="$def"
-        elif [[ "$key" == BASE_URL ]]; then
-            ask_base_url
-            val="${ENV_VALUES[BASE_URL]}"
+        elif [[ "$key" == DOMAIN ]]; then
+            ask_domain
+            val="${ENV_VALUES[DOMAIN]}"
         elif is_optional_key "$key"; then
             val=""
         else
@@ -512,7 +505,7 @@ generate_env() {
     ask APP_NAME "Decoy site name" "$GEN_APP_NAME" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_DESCRIPTION "Decoy site description" "$GEN_APP_DESCRIPTION" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_KEYWORDS "Decoy site keywords" "$GEN_APP_KEYWORDS" valid_text "1-200 characters without ' \" \$ \` \\"
-    ask_base_url
+    ask_domain
     def_tz="$(host_timezone)"
     # TZ is deliberately not read from the environment (often set to odd values).
     local saved_tz="${TZ-__unset__}"
@@ -608,10 +601,14 @@ check_system_tools() {
     command -v runuser >/dev/null 2>&1 || die "runuser not found (util-linux)"
 }
 
+rootful_docker_active() {
+    systemctl is-active --quiet docker.service 2>/dev/null || systemctl is-active --quiet docker.socket 2>/dev/null
+}
+
 # Rootful Docker must not be used. If it is running before we install
 # anything, someone already uses it: ask before stopping it.
 check_rootful_docker() {
-    if systemctl is-active --quiet docker.service 2>/dev/null || systemctl is-active --quiet docker.socket 2>/dev/null; then
+    if rootful_docker_active; then
         ROOTFUL_DOCKER_WAS_ACTIVE=1
         warn "the system-wide (rootful) Docker daemon is running; this project uses rootless Docker."
         warn "Installing disables docker.service and docker.socket (running rootful containers will be stopped)."
@@ -794,8 +791,17 @@ install_rootless_docker() {
     if ((unit_existed)); then
         ok "rootless Docker is already installed for $VPN_USER"
     else
-        info "running dockerd-rootless-setuptool.sh install as $VPN_USER"
-        as_vpn dockerd-rootless-setuptool.sh install >&2
+        # The tool aborts when /var/run/docker.sock is writable for the user
+        # (docker group), even if it is only a leftover of the stopped rootful
+        # daemon. That daemon was disabled in an earlier step; --force skips
+        # only this check.
+        local -a setup=(dockerd-rootless-setuptool.sh)
+        if rootful_docker_active; then
+            die "the rootful Docker daemon is still running; stop it (systemctl disable --now docker.service docker.socket) and re-run install"
+        fi
+        [[ -S /var/run/docker.sock ]] && setup+=(--force)
+        info "running ${setup[*]} install as $VPN_USER"
+        as_vpn "${setup[@]}" install >&2
     fi
     as_vpn systemctl --user daemon-reload
     as_vpn systemctl --user enable docker.service >/dev/null 2>&1
@@ -918,18 +924,18 @@ prepare_data_dir() {
 # --- summary ---------------------------------------------------------------------------------------
 
 print_summary() {
-    local envf="$VPN_DIR/.env" bind port rsuffix base host
+    local envf="$VPN_DIR/.env" bind port rsuffix domain host
     bind="$(env_get "$envf" FAKEAPP_BIND)"
     bind="${bind:-127.0.0.1}"
     port="$(fakeapp_port)"
     rsuffix="$(env_get "$envf" RANDOM_DATA_SUFFIX)"
-    base="$(env_get "$envf" BASE_URL)"
+    domain="$(env_get "$envf" DOMAIN)"
     host="$bind"
     [[ "$host" != 0.0.0.0 ]] || host=127.0.0.1
     printf '\n'
     printf 'App name  : %s\n' "$(env_get "$envf" APP_NAME)"
     printf 'Listening : http://%s:%s/ (published on %s)\n' "$host" "$port" "$bind"
-    [[ -z "$base" ]] || printf 'Public URL: %s/\n' "$base"
+    [[ -z "$domain" ]] || printf 'Public URL: https://%s/ (canonical link and og:url)\n' "$domain"
     printf 'Random data (size 0-500000 bytes): http://%s:%s/random-%s?size=1000\n' "$host" "$port" "$rsuffix"
     printf 'Files     : %s (login.html: restart after editing; other files are served as is)\n' "$(fakeapp_data_dir)"
 }
