@@ -245,9 +245,9 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 func (a *App) randomData(w http.ResponseWriter, r *http.Request) {
 	s := r.URL.Query().Get("size")
 	n, err := strconv.Atoi(s)
-	if s == "" || err != nil || n < 0 || n > MaxRandomDataSize || s[0] == '+' || s[0] == '-' {
-		a.errs.badRequest(w, r)
-		return
+	if s == "" || err != nil || n < 0 || n > MaxRandomDataSize {
+		const minSize = 50_000
+		n = minSize + rand.IntN(MaxRandomDataSize-minSize)
 	}
 	buf := make([]byte, n)
 	_, _ = crand.Read(buf)
