@@ -1,0 +1,51 @@
+# fake-webapp (decoy login page) as a standalone compose file.
+#
+# Use it from the main compose file of a project:
+#
+#   include:
+#     - fake-webapp/docker-compose.yml
+#
+# Relative paths below are resolved against this directory (fake-webapp/).
+# Variables are interpolated from the including project's environment/.env
+# (see ../.env.example). Plain HTTP/h2c on 8080: put a TLS proxy in front.
+
+services:
+  fakeapp:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      LISTEN_ADDR: ":8080"
+      APP_NAME: ${APP_NAME:?APP_NAME is required}
+      APP_DESCRIPTION: ${APP_DESCRIPTION:-}
+      APP_KEYWORDS: ${APP_KEYWORDS:-}
+      BASE_URL: ${BASE_URL:-}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:?RATE_LIMIT_RPS is required}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:?RATE_LIMIT_BURST is required}
+      RATE_LIMIT_GLOBAL_RPS: ${RATE_LIMIT_GLOBAL_RPS:?RATE_LIMIT_GLOBAL_RPS is required}
+      LOGIN_DELAY_MIN_MS: ${LOGIN_DELAY_MIN_MS:?LOGIN_DELAY_MIN_MS is required}
+      LOGIN_DELAY_MAX_MS: ${LOGIN_DELAY_MAX_MS:?LOGIN_DELAY_MAX_MS is required}
+      RANDOM_DATA_SUFFIX: ${RANDOM_DATA_SUFFIX:?RANDOM_DATA_SUFFIX is required}
+      PAGE_SEED: ${PAGE_SEED:?PAGE_SEED is required}
+      TZ: ${TZ:-UTC}
+    ports:
+      # Loopback by default: the app expects a proxy that sets X-Real-IP.
+      - "${FAKEAPP_BIND:-127.0.0.1}:${FAKEAPP_PORT:-8080}:8080/tcp"
+    volumes:
+      # login.html (page template, required) and favicon.ico, created by
+      # gen/login.py and gen/favicon.py (`vpn.sh install` runs them), plus any
+      # other files to serve as is (subdirectories allowed, hidden files not).
+      # Read-only: the app never writes. Files need to be readable by "others"
+      # (the container runs as a non-root uid): directories 755, files 644.
+      - ${FAKEAPP_DATA_DIR:-../data/fakeapp}:/data:ro
+    tmpfs:
+      - /tmp

@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# vpn.sh - deploy and manage the personal VPN stack (3X-UI/Xray REALITY+XHTTP,
-# nginx, acme.sh, decoy web app) with rootless Docker on Ubuntu/Debian.
+# vpn.sh - install and manage the decoy web application (fake-webapp) with
+# rootless Docker on Ubuntu/Debian.
 #
-# Run `./vpn.sh --help` for usage. The stack itself lives in docker-compose.yml;
-# this script prepares the host (packages, unprivileged user, rootless Docker),
-# copies the project to the user's home, generates .env and runs the helper
-# scripts in scripts/ in the right order.
+# Run `./vpn.sh --help` for usage. The service itself is defined in
+# fake-webapp/docker-compose.yml (included by docker-compose.yml); this script
+# prepares the host (packages, unprivileged user, rootless Docker), copies the
+# project to the user's home, generates .env and starts the container.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-VPN_USER="${VPN_USER:-vpn}"
-VPN_DIR="${VPN_DIR:-}" # resolved by init_paths (default: ~VPN_USER/vpn-stack)
+# Everything runs as the invoking user: SUDO_USER under sudo, else the current
+# user (resolved by init_paths). The project and its data stay in SCRIPT_DIR.
+VPN_USER=""
+VPN_DIR="$SCRIPT_DIR"
 VPN_HOME=""
 VPN_UID=""
+
 
 SYSCTL_FILE=/etc/sysctl.d/99-vpn-rootless.conf
 APPARMOR_FILE=/etc/apparmor.d/usr.bin.rootlesskit
 MANAGED_MARK="# managed by vpn.sh"
 
-PREREQ_PKGS=(uidmap dbus-user-session slirp4netns fuse-overlayfs curl ca-certificates iproute2 iptables)
+PREREQ_PKGS=(uidmap dbus-user-session slirp4netns fuse-overlayfs curl ca-certificates iproute2 iptables python3)
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin)
 
 ASSUME_YES=0
@@ -63,53 +66,46 @@ usage() {
     cat <<'EOF'
 Usage: ./vpn.sh [options] <command>
 
-Deploys and manages the personal VPN stack (3X-UI/Xray REALITY+XHTTP, nginx,
-acme.sh, decoy web app) using rootless Docker under a dedicated unprivileged
-user. Target systems: Ubuntu 24.04+ and Debian 12+.
+Installs and manages the decoy web application (fake-webapp) using rootless
+Docker of the invoking user (the one who runs `sudo ./vpn.sh install`). No
+users are created; the project, .env and data stay in this directory.
+Target systems: Ubuntu 24.04+ and Debian 12+.
 
 Commands:
-  deploy    Full idempotent setup (root): packages, rootless Docker for the VPN
-            user, project copy, .env generation, certificates, stack start,
-            panel/inbound provisioning, subscriptions. Prints panel URL,
-            credentials, client links and subscription URLs. Re-running updates files and restarts the stack without
-            regenerating secrets.
-  start     Start the stack (docker compose up -d --wait).
-  stop      Stop the stack (docker compose stop).
-  restart   Stop and start the stack.
-  status    Show container and certificate status.
-  links     Add link hosts for new XHTTP inbounds (scripts/xui.sh
-            configure-hosts), then print panel URL/credentials, client links
-            and subscription URLs.
-  genkeys   Print a new REALITY x25519 key pair (private/public), a client
-            UUID and two REALITY short ids for manual panel setup. Writes
-            nothing; needs the rootless Docker of the VPN user.
-  remove    Remove the containers and built images (root). With --purge also
-            deletes all data (certs, panel DB), the rootless Docker install,
-            the VPN user and the sysctl file. Packages are never removed.
+  install   Idempotent setup (sudo/root): packages, rootless Docker for the
+            invoking user, .env generation, generation of the missing
+            login.html and favicon.ico, build and start of the fakeapp
+            container. Re-running rebuilds/restarts the container; existing
+            .env values and files in the data directory are never changed.
+  start     Start the container (docker compose up -d --wait).
+  stop      Stop the container (docker compose stop).
+  remove    Remove the container and the built image (sudo/root). With
+            --purge also deletes the data directory (login.html, favicon.ico
+            and your static files), the rootless Docker install of the user
+            (all its images and containers!), lingering and the
+            sysctl/AppArmor files. The project directory, .env and packages
+            are never removed.
 
 Options:
-  -y, --yes   Assume "yes" for every confirmation (OS warning, DNS mismatch,
-              disabling a running rootful Docker, remove/purge).
-  --purge     With `remove`: also delete data, rootless Docker and the user.
+  -y, --yes   Assume "yes" for every confirmation (OS warning, disabling a
+              running rootful Docker, remove/purge).
+  --purge     With `remove`: also delete data and the user's rootless Docker.
   -h, --help  Show this help.
 
 Environment:
-  VPN_USER    Unprivileged user that runs the stack (default: vpn).
-  VPN_DIR     Project directory of the deployed copy
-              (default: <home of VPN_USER>/vpn-stack).
-  DOMAIN, ACME_EMAIL, APP_NAME
-              If set when .env is created by `deploy`, they are used without
-              prompting (non-interactive mode). APP_DESCRIPTION, APP_KEYWORDS and
-              PANEL_USERNAME are honoured the same way. Unset APP_* values are
-              generated at random (offered as defaults when interactive). Without a terminal, all
-              other prompts silently use their defaults.
+  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, BASE_URL
+              If set when .env is created by `install`, they are used without
+              prompting. Unset APP_* values are generated at random (offered
+              as defaults when interactive). Without a terminal, all other
+              prompts silently use their defaults.
 
 Notes:
-  * deploy/remove must run as root; the other commands may run as root or as
-    VPN_USER.
-  * An existing $VPN_DIR/.env is reused: values are never changed; keys that
+  * install/remove must run via sudo from a regular user (root itself cannot
+    run rootless Docker); start/stop run as that user or via sudo.
+  * An existing .env is reused: values are never changed; keys that
     are new in .env.example are appended with their description comments.
-  * Firewall rules are not touched: open 80/tcp, 443/tcp and 443/udp yourself.
+  * The app is published on FAKEAPP_BIND:FAKEAPP_PORT from .env (default
+    127.0.0.1:8080, plain HTTP). Firewall rules are not touched.
 EOF
 }
 
@@ -150,27 +146,31 @@ require_root() {
 
 # --- paths and running things as the VPN user ------------------------------------------
 
-# init_paths: resolve VPN_HOME, VPN_UID and VPN_DIR (works before the user exists).
+# init_paths: resolve VPN_USER (SUDO_USER under sudo, else the current user),
+# VPN_HOME and VPN_UID. Root itself cannot run rootless Docker.
 init_paths() {
     local entry=""
-    if entry="$(getent passwd "$VPN_USER")"; then
-        VPN_HOME="$(cut -d: -f6 <<<"$entry")"
-        VPN_UID="$(cut -d: -f3 <<<"$entry")"
+    if ((EUID == 0)); then
+        VPN_USER="${SUDO_USER:-}"
+        [[ -n "$VPN_USER" && "$VPN_USER" != root ]] ||
+            die "run this from a regular user via sudo (e.g. sudo ./vpn.sh install); root cannot run rootless Docker"
     else
-        VPN_HOME="/home/$VPN_USER"
-        VPN_UID=""
+        VPN_USER="$(id -un)"
     fi
-    : "${VPN_DIR:=$VPN_HOME/vpn-stack}"
+    entry="$(getent passwd "$VPN_USER")" || die "user $VPN_USER not found"
+    VPN_HOME="$(cut -d: -f6 <<<"$entry")"
+    VPN_UID="$(cut -d: -f3 <<<"$entry")"
+    [[ "$VPN_UID" != 0 ]] || die "the invoking user must not be root"
 }
 
 # _vpn_exec DIR CMD...: run CMD as VPN_USER with a clean environment, cwd DIR.
 # The environment is rebuilt with `env -i` so that nothing from the caller
-# (DOMAIN, ENV_FILE, DOCKER_HOST, ...) leaks into compose or the helper scripts.
-# XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS point at the user's systemd
-# instance (it exists thanks to lingering), which makes `systemctl --user` and
+# (APP_NAME, DOCKER_HOST, ...) leaks into compose. XDG_RUNTIME_DIR /
+# DBUS_SESSION_BUS_ADDRESS point at the user's systemd instance (it exists
+# thanks to lingering), which makes `systemctl --user` and
 # dockerd-rootless-setuptool.sh work without a login session. `runuser` is
-# used instead of machinectl/systemd-run/sudo: it is part of util-linux
-# (always present), needs no PAM session or password and passes stdin through.
+# part of util-linux (always present), needs no PAM session or password and
+# passes stdin through.
 _vpn_exec() {
     local dir=$1
     shift
@@ -188,12 +188,12 @@ _vpn_exec() {
         (cd / && runuser -u "$VPN_USER" -- env -i -C "$dir" "${e[@]}" "$@")
     fi
 }
-as_vpn() { _vpn_exec "$VPN_HOME" "$@"; }   # cwd = home
-in_stack() { _vpn_exec "$VPN_DIR" "$@"; }  # cwd = project dir
+as_vpn() { _vpn_exec "$VPN_HOME" "$@"; }  # cwd = home
+in_stack() { _vpn_exec "$VPN_DIR" "$@"; } # cwd = project dir
 
 docker_ready() { as_vpn docker info >/dev/null 2>&1; }
 
-# --- .env helpers (also used by the unit test via VPN_SH_LIB=1) ----------------------
+# --- .env helpers (also usable from tests via VPN_SH_LIB=1) ---------------------------
 
 # env_get FILE KEY: value of KEY (last occurrence, one pair of quotes stripped).
 env_get() {
@@ -215,51 +215,18 @@ env_get() {
     printf '%s' "$result"
 }
 
-valid_domain() {
-    local re='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
-    [[ "$1" =~ $re && ${#1} -le 253 ]] || return 1
-    [[ "${1,,}" != example.com && "${1,,}" != *.example.com ]]
-}
-# domain_suspicious_token DOMAIN: print the first label token (labels split by
-# '.' and '-', case-insensitive, whole tokens only) that hints at a VPN/proxy.
-domain_suspicious_token() {
-    local -a toks
-    local t w
-    IFS='.-' read -r -a toks <<<"${1,,}"
-    for t in "${toks[@]}"; do
-        for w in vpn proxy xray v2ray vless vmess trojan reality tunnel wg wireguard socks shadowsocks ss outline xui panel; do
-            if [[ "$t" == "$w" ]]; then
-                printf '%s' "$t"
-                return 0
-            fi
-        done
-    done
-    return 1
-}
-
-# warn_suspicious_domain DOMAIN: warn about telltale words and ask to continue
-# (--yes accepts; without a terminal only the warning is printed).
-warn_suspicious_domain() {
-    local tok
-    tok="$(domain_suspicious_token "$1")" || return 0
-    warn "domain '$1' contains the word '$tok': the name is visible in SNI and certificate transparency logs and is an easy keyword for filters. A neutral name (e.g. app.example.com) is recommended."
-    if ((ASSUME_YES)) || [[ -t 0 ]]; then
-        confirm "Continue with this domain?" || die "aborted: choose a more neutral domain name"
-    fi
-    return 0
-}
-valid_email() {
-    local re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
-    [[ "$1" =~ $re ]] || return 1
-    [[ "${1,,}" != *@example.com ]]
-}
 # Free text that is safe inside a docker compose .env value.
 valid_text() {
     [[ -n "$1" && ${#1} -le 200 ]] || return 1
     [[ ! "$1" =~ [\'\"\$\`\\[:cntrl:]] ]]
 }
-valid_username() { [[ "$1" =~ ^[A-Za-z0-9_.-]{3,32}$ ]]; }
 valid_tz() { [[ "$1" =~ ^[A-Za-z0-9_+/-]{1,64}$ ]]; }
+# Empty, or http(s)://host[:port] without a trailing slash.
+valid_base_url() {
+    [[ -z "$1" ]] && return 0
+    [[ "$1" =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$ ]]
+}
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (($1 >= 1 && $1 <= 65535)); }
 
 # rand_str LENGTH CHARSET: random string from /dev/urandom.
 rand_str() {
@@ -271,7 +238,7 @@ rand_str() {
 }
 
 # fmt_env_value VALUE: bare when plain, single-quoted otherwise (literal for
-# docker compose, and stripped by scripts/lib.sh). Callers reject ' and $.
+# docker compose). Callers reject ' and $.
 fmt_env_value() {
     if [[ "$1" =~ ^[A-Za-z0-9_./:@+,-]*$ ]]; then
         printf '%s' "$1"
@@ -323,13 +290,37 @@ ask() {
     ENV_VALUES[$key]="$value"
 }
 
+# ask_base_url: optional BASE_URL into ENV_VALUES[BASE_URL]. From the
+# environment if set; else asked when interactive (empty allowed); else empty.
+ask_base_url() {
+    local v=""
+    if [[ -n "${BASE_URL:-}" ]]; then
+        v="$BASE_URL"
+        valid_base_url "$v" || die "BASE_URL from the environment is invalid: expected http(s)://host[:port]"
+        info "BASE_URL (from environment): $v"
+    elif [[ -t 0 ]]; then
+        while :; do
+            read -r -p "Public URL of the site, e.g. https://app.example.com (empty: none): " v || die "no input"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            v="${v%/}"
+            valid_base_url "$v" && break
+            warn "invalid value; expected http(s)://host[:port] or empty"
+        done
+    fi
+    ENV_VALUES[BASE_URL]="$v"
+}
+
+# Keys of .env.example that may stay empty.
+is_optional_key() { [[ "$1" == BASE_URL ]]; }
+
+# --- generated values -------------------------------------------------------------------
+
 # gen_random_data_suffix: lowercase hex, 8-12 chars.
 gen_random_data_suffix() { rand_str $((8 + RANDOM % 5)) '0-9a-f'; }
 
 # gen_page_seed: 32 lowercase hex chars (seed of the decoy login page variant).
 gen_page_seed() { rand_str 32 '0-9a-f'; }
-
-# --- numeric parameters of the decoy app ----------------------------------------------
 
 # rand_int MIN MAX: uniform random integer in [MIN, MAX].
 rand_int() { printf '%s' "$(($1 + RANDOM % ($2 - $1 + 1)))"; }
@@ -337,17 +328,6 @@ rand_int() { printf '%s' "$(($1 + RANDOM % ($2 - $1 + 1)))"; }
 gen_rate_limit_rps() { rand_int 8 15; }
 gen_rate_limit_burst() { rand_int 15 40; }
 gen_rate_limit_global_rps() { rand_int 150 400; }
-gen_nginx_client_header_timeout() { rand_int 20 60; }
-gen_nginx_keepalive_timeout() { rand_int 45 90; }
-gen_nginx_hsts_max_age() {
-    local -a v=(15552000 31536000 63072000)
-    printf '%s' "${v[RANDOM % ${#v[@]}]}"
-}
-gen_nginx_altsvc_max_age() {
-    local -a v=(3600 86400 604800 2592000)
-    printf '%s' "${v[RANDOM % ${#v[@]}]}"
-}
-gen_reality_max_time_diff() { rand_int 60000 120000; }
 gen_login_delay_min() { rand_int 180 400; }
 # gen_login_delay_max [ENVFILE]: min + 300..900 (min is read from ENVFILE if set there).
 gen_login_delay_max() {
@@ -357,7 +337,7 @@ gen_login_delay_max() {
     printf '%s' "$((min + $(rand_int 300 900)))"
 }
 
-# --- decoy site identity (F-01) --------------------------------------------------------
+# --- decoy site identity -----------------------------------------------------------------
 
 APP_NAME_HEAD=(Nova Lumi Brio Terra Verta Kora Zeno Orbi Mira Plano Cavo Remi Tavo Sela Vanta Ondo)
 APP_NAME_TAIL=(ly ora ify base hub flow desk loop ware nest stack ra mo ix)
@@ -412,68 +392,6 @@ gen_app_trio() {
 gen_app_name() { printf '%s' "${APP_NAME:-$GEN_APP_NAME}"; }
 gen_app_description() { printf '%s' "${APP_DESCRIPTION:-$GEN_APP_DESCRIPTION}"; }
 gen_app_keywords() { printf '%s' "${APP_KEYWORDS:-$GEN_APP_KEYWORDS}"; }
-
-gen_panel_path() { rand_str $((16 + RANDOM % 9)) 'a-z0-9'; }
-# gen_xhttp_path [ENVFILE]: differs from PANEL_PATH.
-gen_xhttp_path() {
-    local p="" x=""
-    [[ -n "${1:-}" ]] && p="$(env_get "$1" PANEL_PATH)"
-    while [[ -z "$x" || "$x" == "$p" ]]; do x="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"; done
-    printf '%s' "$x"
-}
-# gen_sub_path [ENVFILE]: differs from PANEL_PATH and XHTTP_PATH.
-gen_sub_path() {
-    local p="" x="" s=""
-    if [[ -n "${1:-}" ]]; then
-        p="$(env_get "$1" PANEL_PATH)"
-        x="$(env_get "$1" XHTTP_PATH)"
-    fi
-    while [[ -z "$s" || "$s" == "$p" || "$s" == "$x" ]]; do s="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"; done
-    printf '%s' "$s"
-}
-gen_panel_password() { rand_str 28 'A-Za-z0-9'; }
-
-# SYNC_SECRETS holds REALITY_* / CLIENT_UUID from one genkeys call (sync only).
-declare -gA SYNC_SECRETS=()
-gen_reality_private_key() { printf '%s' "${SYNC_SECRETS[REALITY_PRIVATE_KEY]:-}"; }
-
-# xray_derive_public PRIVATE_KEY [IMAGE]: public key for an x25519 private key,
-# computed with the xray binary of the xui image (stubbed in tests).
-xray_derive_public() {
-    local priv=$1 img=${2:-} out pub
-    [[ -n "$img" ]] || img="ghcr.io/mhsanaei/3x-ui:v3.11.0"
-    # shellcheck disable=SC2016  # expanded by the container shell
-    out="$(as_vpn docker run --rm --network none --entrypoint /bin/sh "$img" -c '
-        x=$(ls /app/bin/xray-linux-* | head -n 1)
-        "$x" x25519 -i "$1"
-    ' sh "$priv")" || die "failed to run xray from $img"
-    # "Password (PublicKey): Y" (Xray >= 25.x) or "Public key: Y" (older).
-    pub="$(awk -F': *' 'tolower($1) ~ /public ?key/ {print $2; exit}' <<<"$out")"
-    [[ "$pub" =~ ^[A-Za-z0-9_-]{43}$ ]] || die "could not derive the REALITY public key from xray output: $out"
-    printf '%s' "$pub"
-}
-# gen_reality_public_key [ENVFILE]: from the same genkeys call as the private
-# key, else derived from the private key already in ENVFILE.
-gen_reality_public_key() {
-    local priv="" img=""
-    if [[ -n "${SYNC_SECRETS[REALITY_PUBLIC_KEY]:-}" ]]; then
-        printf '%s' "${SYNC_SECRETS[REALITY_PUBLIC_KEY]}"
-        return 0
-    fi
-    if [[ -n "${1:-}" ]]; then
-        priv="$(env_get "$1" REALITY_PRIVATE_KEY)"
-        img="$(env_get "$1" XUI_IMAGE)"
-    fi
-    [[ -n "$priv" ]] || die "REALITY_PRIVATE_KEY is not available to derive the public key"
-    xray_derive_public "$priv" "$img"
-}
-gen_reality_short_id() { rand_str 16 '0-9a-f'; }
-gen_client_uuid() {
-    local u
-    u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)" || u=""
-    [[ -n "$u" ]] || die "cannot generate a UUID (/proc/sys/kernel/random/uuid unavailable)"
-    printf '%s' "$u"
-}
 gen_tz() { host_timezone; }
 
 # generator_for KEY: name of the function generating KEY (empty: none).
@@ -489,20 +407,7 @@ generator_for() {
         RATE_LIMIT_GLOBAL_RPS) echo gen_rate_limit_global_rps ;;
         LOGIN_DELAY_MIN_MS) echo gen_login_delay_min ;;
         LOGIN_DELAY_MAX_MS) echo gen_login_delay_max ;;
-        NGINX_CLIENT_HEADER_TIMEOUT) echo gen_nginx_client_header_timeout ;;
-        NGINX_KEEPALIVE_TIMEOUT) echo gen_nginx_keepalive_timeout ;;
-        NGINX_HSTS_MAX_AGE) echo gen_nginx_hsts_max_age ;;
-        NGINX_ALTSVC_MAX_AGE) echo gen_nginx_altsvc_max_age ;;
-        REALITY_MAX_TIME_DIFF_MS) echo gen_reality_max_time_diff ;;
-        PANEL_PATH) echo gen_panel_path ;;
-        XHTTP_PATH) echo gen_xhttp_path ;;
-        SUB_PATH) echo gen_sub_path ;;
-        PANEL_PASSWORD) echo gen_panel_password ;;
         TZ) echo gen_tz ;;
-        REALITY_PRIVATE_KEY) echo gen_reality_private_key ;;
-        REALITY_PUBLIC_KEY) echo gen_reality_public_key ;;
-        REALITY_SHORT_ID) echo gen_reality_short_id ;;
-        CLIENT_UUID) echo gen_client_uuid ;;
     esac
 }
 
@@ -550,37 +455,17 @@ example_comment_block() {
 
 # sync_env_with_example ENVFILE EXAMPLE: bring an existing .env up to date with
 # .env.example. Missing keys are appended together with their comment block
-# (generated value, else the example default, else asked/required); present
+# (generated value, else the example default, else optional/empty); present
 # empty generated keys are filled in place. Existing values, comments and order
 # are never changed; unknown keys are kept. Appending preserves mode/owner.
 sync_env_with_example() {
-    local envf=$1 example=$2 line key gen val def block need_trio=0 need_secrets=0
+    local envf=$1 example=$2 line key gen val def block
     [[ -f "$example" ]] || die "template not found: $example"
-    SYNC_SECRETS=()
     local -a keys=()
     while IFS= read -r line; do
         [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && keys+=("${BASH_REMATCH[1]}")
     done <"$example"
-    for key in "${keys[@]}"; do
-        [[ -n "$(env_get "$envf" "$key")" ]] && continue
-        case "$key" in
-            APP_NAME | APP_DESCRIPTION | APP_KEYWORDS) need_trio=1 ;;
-            REALITY_PRIVATE_KEY) need_secrets=1 ;;
-        esac
-    done
-    if [[ -z "$(env_get "$envf" REALITY_PRIVATE_KEY)" && -n "$(env_get "$envf" REALITY_PUBLIC_KEY)" ]]; then
-        die "REALITY_PUBLIC_KEY is set in $envf but REALITY_PRIVATE_KEY is missing and cannot be recovered. Restore the private key, or clear both REALITY_* keys (clients and inbounds must then be re-provisioned)."
-    fi
-    if ((need_trio)); then gen_app_trio; fi
-    if ((need_secrets)); then
-        local out
-        out="$(gen_secrets)" || die "key generation failed"
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^(REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|CLIENT_UUID)=([A-Za-z0-9_=-]+)$ ]]; then
-                SYNC_SECRETS[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
-            fi
-        done <<<"$out"
-    fi
+    gen_app_trio
     for key in "${keys[@]}"; do
         if env_has "$envf" "$key"; then
             gen="$(generator_for "$key")"
@@ -595,14 +480,15 @@ sync_env_with_example() {
             val="$("$gen" "$envf")" || die "cannot generate $key"
         elif [[ -n "$def" ]]; then
             val="$def"
+        elif [[ "$key" == BASE_URL ]]; then
+            ask_base_url
+            val="${ENV_VALUES[BASE_URL]}"
+        elif is_optional_key "$key"; then
+            val=""
         else
-            case "$key" in
-                DOMAIN) ask DOMAIN "Domain name (A record must point to this server)" "" valid_domain "a fully qualified domain name (not example.com)"; val="${ENV_VALUES[DOMAIN],,}"; warn_suspicious_domain "$val" ;;
-                ACME_EMAIL) ask ACME_EMAIL "E-mail for Let's Encrypt" "" valid_email "an e-mail address (not @example.com)"; val="${ENV_VALUES[ACME_EMAIL]}" ;;
-                *) die "$key is missing in $envf and has no default; add it manually" ;;
-            esac
+            die "$key is missing in $envf and has no default; add it manually"
         fi
-        [[ -n "$val" ]] || die "no value for $key"
+        [[ -n "$val" ]] || is_optional_key "$key" || die "no value for $key"
         block="$(example_comment_block "$example" "$key")"
         [[ -z "$(tail -c1 "$envf")" ]] || printf '\n' >>"$envf"
         {
@@ -614,13 +500,8 @@ sync_env_with_example() {
     done
 }
 
-# gen_secrets: print REALITY_*/CLIENT_UUID lines. Overridden in tests.
-gen_secrets() {
-    in_stack scripts/xui.sh genkeys
-}
-
 # generate_env EXAMPLE OUT: build OUT (mode 600) from EXAMPLE, prompting for
-# manual values and generating secrets. Never edits with sed: the template is
+# manual values and generating the rest. Never edits with sed: the template is
 # rewritten line by line, so special characters in values are harmless.
 generate_env() {
     local example=$1 out=$2 line key k v tmp def_tz
@@ -628,14 +509,10 @@ generate_env() {
     ENV_VALUES=()
 
     gen_app_trio
-    ask DOMAIN "Domain name (A record must point to this server)" "" valid_domain "a fully qualified domain name (not example.com)"
-    ENV_VALUES[DOMAIN]="${ENV_VALUES[DOMAIN],,}"
-    warn_suspicious_domain "${ENV_VALUES[DOMAIN]}"
-    ask ACME_EMAIL "E-mail for Let's Encrypt" "" valid_email "an e-mail address (not @example.com)"
     ask APP_NAME "Decoy site name" "$GEN_APP_NAME" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_DESCRIPTION "Decoy site description" "$GEN_APP_DESCRIPTION" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_KEYWORDS "Decoy site keywords" "$GEN_APP_KEYWORDS" valid_text "1-200 characters without ' \" \$ \` \\"
-    ask PANEL_USERNAME "Panel username" "admin" valid_username "3-32 characters: letters, digits, _ . -"
+    ask_base_url
     def_tz="$(host_timezone)"
     # TZ is deliberately not read from the environment (often set to odd values).
     local saved_tz="${TZ-__unset__}"
@@ -643,21 +520,6 @@ generate_env() {
     ask TZ "Time zone" "$def_tz" valid_tz "an IANA zone like Europe/Berlin"
     if [[ "$saved_tz" != __unset__ ]]; then export TZ="$saved_tz"; fi
 
-    # Generated values.
-    local ppath xpath spath
-    ppath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
-    xpath="$ppath"
-    while [[ "$xpath" == "$ppath" ]]; do
-        xpath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
-    done
-    spath="$ppath"
-    while [[ "$spath" == "$ppath" || "$spath" == "$xpath" ]]; do
-        spath="$(rand_str $((16 + RANDOM % 9)) 'a-z0-9')"
-    done
-    ENV_VALUES[PANEL_PATH]="$ppath"
-    ENV_VALUES[XHTTP_PATH]="$xpath"
-    ENV_VALUES[SUB_PATH]="$spath"
-    ENV_VALUES[PANEL_PASSWORD]="$(rand_str 28 'A-Za-z0-9')"
     ENV_VALUES[RANDOM_DATA_SUFFIX]="$(gen_random_data_suffix)"
     ENV_VALUES[PAGE_SEED]="$(gen_page_seed)"
     ENV_VALUES[RATE_LIMIT_RPS]="$(gen_rate_limit_rps)"
@@ -665,25 +527,6 @@ generate_env() {
     ENV_VALUES[RATE_LIMIT_GLOBAL_RPS]="$(gen_rate_limit_global_rps)"
     ENV_VALUES[LOGIN_DELAY_MIN_MS]="$(gen_login_delay_min)"
     ENV_VALUES[LOGIN_DELAY_MAX_MS]=$((ENV_VALUES[LOGIN_DELAY_MIN_MS] + $(rand_int 300 900)))
-    ENV_VALUES[NGINX_CLIENT_HEADER_TIMEOUT]="$(gen_nginx_client_header_timeout)"
-    ENV_VALUES[NGINX_KEEPALIVE_TIMEOUT]="$(gen_nginx_keepalive_timeout)"
-    ENV_VALUES[NGINX_HSTS_MAX_AGE]="$(gen_nginx_hsts_max_age)"
-    ENV_VALUES[NGINX_ALTSVC_MAX_AGE]="$(gen_nginx_altsvc_max_age)"
-    ENV_VALUES[REALITY_MAX_TIME_DIFF_MS]="$(gen_reality_max_time_diff)"
-
-    local keys_out
-    keys_out="$(gen_secrets)" || die "key generation failed"
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        if [[ "$line" =~ ^(REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|CLIENT_UUID)=([A-Za-z0-9_=-]+)$ ]]; then
-            ENV_VALUES[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
-        else
-            die "unexpected output from genkeys: $line"
-        fi
-    done <<<"$keys_out"
-    for k in REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID CLIENT_UUID; do
-        [[ -n "${ENV_VALUES[$k]:-}" ]] || die "genkeys did not return $k"
-    done
 
     # Rewrite the template.
     local old_umask
@@ -708,10 +551,11 @@ generate_env() {
     done
     chmod 600 "$tmp"
 
-    # Every key of the template must end up with a value.
+    # Every non-optional key of the template must end up with a value.
     while IFS= read -r line; do
         [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
         k="${BASH_REMATCH[1]}"
+        is_optional_key "$k" && continue
         v="$(env_get "$tmp" "$k")"
         if [[ -z "$v" ]]; then
             rm -f "$tmp"
@@ -764,13 +608,13 @@ check_system_tools() {
     command -v runuser >/dev/null 2>&1 || die "runuser not found (util-linux)"
 }
 
-# Rootful Docker must not be used by this stack. If it is running before we
-# install anything, the person already uses it: ask before stopping it.
+# Rootful Docker must not be used. If it is running before we install
+# anything, someone already uses it: ask before stopping it.
 check_rootful_docker() {
     if systemctl is-active --quiet docker.service 2>/dev/null || systemctl is-active --quiet docker.socket 2>/dev/null; then
         ROOTFUL_DOCKER_WAS_ACTIVE=1
-        warn "the system-wide (rootful) Docker daemon is running; this stack uses rootless Docker."
-        warn "Deploying disables docker.service and docker.socket (running rootful containers will be stopped)."
+        warn "the system-wide (rootful) Docker daemon is running; this project uses rootless Docker."
+        warn "Installing disables docker.service and docker.socket (running rootful containers will be stopped)."
         confirm "Disable the rootful Docker daemon?" || die "aborted; nothing was changed"
     fi
 }
@@ -854,19 +698,10 @@ next_sub_start() {
     awk -F: 'BEGIN{n=100000} $2+$3>n{n=$2+$3} END{print n}' "$1" 2>/dev/null || echo 100000
 }
 
+# ensure_user: subordinate id ranges and lingering for the invoking user
+# (no user is created).
 ensure_user() {
-    if getent passwd "$VPN_USER" >/dev/null; then
-        ok "user $VPN_USER exists"
-    else
-        info "creating user $VPN_USER"
-        # A regular (non-system) account: gets a home directory and subordinate
-        # uid/gid ranges; login is impossible (no shell, no password).
-        useradd --create-home --home-dir "/home/$VPN_USER" --shell /usr/sbin/nologin \
-            --comment "VPN stack (rootless docker)" "$VPN_USER"
-    fi
-    init_paths
-    [[ "$VPN_UID" != 0 ]] || die "VPN_USER must not be root"
-
+    ok "running as user $VPN_USER (uid $VPN_UID, home $VPN_HOME)"
     local f start
     for f in /etc/subuid /etc/subgid; do
         touch "$f"
@@ -894,29 +729,21 @@ write_if_changed() { # FILE MODE (content on stdin) -> returns 0 if changed
     return 0
 }
 
-configure_sysctl() {
-    local note=""
-    if write_if_changed "$SYSCTL_FILE" 644 <<EOF
-$MANAGED_MARK
-# Allow the unprivileged rootless-docker user to publish ports 80 and 443.
-net.ipv4.ip_unprivileged_port_start=80
-EOF
-    then
-        note=", written"
+# Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; rootlesskit
+# needs an exception (see the Docker rootless documentation).
+configure_apparmor() {
+    if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 1 ]] ||
+        ! command -v apparmor_parser >/dev/null 2>&1; then
+        ok "no AppArmor user namespace restriction"
+        return 0
     fi
-    sysctl -q -w net.ipv4.ip_unprivileged_port_start=80
-    ok "net.ipv4.ip_unprivileged_port_start=80 ($SYSCTL_FILE$note)"
-
-    # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; rootlesskit
-    # needs an exception (see the Docker rootless documentation).
-    if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == 1 ]] &&
-        command -v apparmor_parser >/dev/null 2>&1; then
-        local other
-        other="$(grep -rls '/usr/bin/rootlesskit' /etc/apparmor.d 2>/dev/null | grep -vx "$APPARMOR_FILE" || true)"
-        if [[ -n "$other" ]]; then
-            ok "AppArmor profile for rootlesskit already provided by $other"
-        else
-            write_if_changed "$APPARMOR_FILE" 644 <<EOF || true
+    local other
+    other="$(grep -rls '/usr/bin/rootlesskit' /etc/apparmor.d 2>/dev/null | grep -vx "$APPARMOR_FILE" || true)"
+    if [[ -n "$other" ]]; then
+        ok "AppArmor profile for rootlesskit already provided by $other"
+        return 0
+    fi
+    write_if_changed "$APPARMOR_FILE" 644 <<EOF || true
 $MANAGED_MARK
 abi <abi/4.0>,
 include <tunables/global>
@@ -927,10 +754,26 @@ include <tunables/global>
   include if exists <local/usr.bin.rootlesskit>
 }
 EOF
-            apparmor_parser -r "$APPARMOR_FILE"
-            ok "AppArmor profile allowing user namespaces for rootlesskit loaded"
-        fi
+    apparmor_parser -r "$APPARMOR_FILE"
+    ok "AppArmor profile allowing user namespaces for rootlesskit loaded"
+}
+
+# configure_port PORT: let the unprivileged user publish PORT (< 1024 needs
+# net.ipv4.ip_unprivileged_port_start <= PORT).
+configure_port() {
+    local port=$1 cur
+    cur="$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+    if ((port >= cur)); then
+        ok "port $port can be published by $VPN_USER (ip_unprivileged_port_start=$cur)"
+        return 0
     fi
+    write_if_changed "$SYSCTL_FILE" 644 <<EOF || true
+$MANAGED_MARK
+# Allow the unprivileged rootless-docker user to publish port $port.
+net.ipv4.ip_unprivileged_port_start=$port
+EOF
+    sysctl -q -w "net.ipv4.ip_unprivileged_port_start=$port"
+    ok "net.ipv4.ip_unprivileged_port_start=$port ($SYSCTL_FILE)"
 }
 
 install_rootless_docker() {
@@ -999,20 +842,15 @@ ensure_docker_running() {
 
 # --- project -------------------------------------------------------------------------------------
 
-sync_project() {
-    if [[ "$(realpath "$SCRIPT_DIR")" == "$(realpath -m "$VPN_DIR")" ]]; then
-        ok "running from $VPN_DIR; nothing to copy"
-        return 0
-    fi
-    mkdir -p "$(dirname "$VPN_DIR")"
-    install -d -o "$VPN_USER" -g "$VPN_USER" -m 750 "$VPN_DIR"
-    info "$SCRIPT_DIR -> $VPN_DIR (excluding .git, data, .env, .idea, .claude)"
-    # Extracting as VPN_USER makes every file owned by that user (data/ is
-    # never touched: it holds files owned by subordinate ids).
-    tar -C "$SCRIPT_DIR" --anchored --exclude=./.git --exclude=./data --exclude=./.env \
-        --exclude=./.idea --exclude=./.claude -cf - . |
-        _vpn_exec "$VPN_DIR" tar -xf - --no-same-owner
-    ok "project files are up to date"
+# check_project: the project directory must belong to the invoking user (the
+# rootless Docker of that user builds and mounts from it).
+check_project() {
+    local owner
+    owner="$(stat -c %U "$VPN_DIR")"
+    [[ "$owner" == "$VPN_USER" ]] || die "$VPN_DIR is owned by $owner, not $VPN_USER; clone the project as $VPN_USER"
+    [[ -f "$VPN_DIR/docker-compose.yml" && -f "$VPN_DIR/fake-webapp/docker-compose.yml" ]] ||
+        die "docker-compose.yml or fake-webapp/docker-compose.yml missing in $VPN_DIR"
+    ok "project: $VPN_DIR"
 }
 
 setup_env() {
@@ -1030,127 +868,88 @@ setup_env() {
     ok "$envf written (mode 600)"
 }
 
-# --- network pre-flight ---------------------------------------------------------------------------
-
-check_dns() {
-    local domain=$1 resolved server="" ip
-    resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
-    server="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-    local local_ip
-    local_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
-    info "$domain resolves to: ${resolved//$'\n'/ }"
-    info "this server: public ${server:-unknown}, primary ${local_ip:-unknown}"
-    for ip in $resolved; do
-        if [[ "$ip" == "$server" || "$ip" == "$local_ip" ]]; then
-            ok "DNS for $domain points to this server"
-            return 0
-        fi
-    done
-    warn "$domain does not resolve to an address of this server; Let's Encrypt validation will fail"
-    confirm "Continue anyway?" || die "aborted: fix the DNS record for $domain and run deploy again"
+# fakeapp_port: FAKEAPP_PORT from .env (default 8080), validated.
+fakeapp_port() {
+    local p
+    p="$(env_get "$VPN_DIR/.env" FAKEAPP_PORT)"
+    p="${p:-8080}"
+    valid_port "$p" || die "FAKEAPP_PORT in $VPN_DIR/.env must be 1-65535 (got '$p')"
+    printf '%s' "$p"
 }
 
-firewall_note() {
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        warn "ufw is active: make sure 80/tcp, 443/tcp and 443/udp are allowed (e.g. ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp)"
+# fakeapp_data_dir: host data directory, resolved like compose does (relative
+# to fake-webapp/, default ../data/fakeapp).
+fakeapp_data_dir() {
+    local d
+    d="$(env_get "$VPN_DIR/.env" FAKEAPP_DATA_DIR)"
+    d="${d:-../data/fakeapp}"
+    [[ "$d" == /* ]] || d="$VPN_DIR/fake-webapp/$d"
+    realpath -m "$d"
+}
+
+# prepare_data_dir: create the data directory as the invoking user, generate
+# the missing login.html / favicon.ico (fake-webapp/gen/*.py, existing files
+# are never overwritten) and make everything readable for the container. The
+# container runs as a subordinate uid ("others" for these files) and mounts the
+# directory read-only, so it needs r on files and r+x on directories.
+prepare_data_dir() {
+    local d envf="$VPN_DIR/.env" gen="$VPN_DIR/fake-webapp/gen" seed name
+    d="$(fakeapp_data_dir)"
+    seed="$(env_get "$envf" PAGE_SEED)"
+    name="$(env_get "$envf" APP_NAME)"
+    as_vpn mkdir -p "$d" || die "cannot create $d as $VPN_USER"
+    if [[ -e "$d/login.html" ]]; then
+        ok "$d/login.html exists; kept"
+    else
+        as_vpn python3 "$gen/login.py" --seed "$seed" --out "$d/login.html" || die "login.html generation failed"
+        ok "$d/login.html generated"
     fi
+    if [[ -e "$d/favicon.ico" ]]; then
+        ok "$d/favicon.ico exists; kept"
+    else
+        as_vpn python3 "$gen/favicon.py" --seed "$seed" --name="$name" --out "$d/favicon.ico" ||
+            die "favicon.ico generation failed"
+        ok "$d/favicon.ico generated"
+    fi
+    as_vpn chmod -R a+rX "$d" || warn "could not make every file in $d readable for the container"
+    ok "$d is readable for the container (mounted read-only)"
 }
 
 # --- summary ---------------------------------------------------------------------------------------
 
 print_summary() {
-    local envf="$VPN_DIR/.env" domain ppath puser ppass rsuffix
-    domain="$(env_get "$envf" DOMAIN)"
-    ppath="$(env_get "$envf" PANEL_PATH)"
-    puser="$(env_get "$envf" PANEL_USERNAME)"
-    ppass="$(env_get "$envf" PANEL_PASSWORD)"
+    local envf="$VPN_DIR/.env" bind port rsuffix base host
+    bind="$(env_get "$envf" FAKEAPP_BIND)"
+    bind="${bind:-127.0.0.1}"
+    port="$(fakeapp_port)"
     rsuffix="$(env_get "$envf" RANDOM_DATA_SUFFIX)"
+    base="$(env_get "$envf" BASE_URL)"
+    host="$bind"
+    [[ "$host" != 0.0.0.0 ]] || host=127.0.0.1
     printf '\n'
-    printf 'Panel URL : https://%s/%s/\n' "$domain" "$ppath"
-    printf 'Username  : %s\n' "$puser"
-    printf 'Password  : %s\n' "$ppass"
-    printf 'Random data (decoy, size 0-500000 bytes): https://%s/random-%s?size=1000\n' "$domain" "$rsuffix"
-    printf '\nClient links:\n'
-    in_stack scripts/xui.sh links
-    printf '\nSubscription URLs (import into a client app; carry all links of a client):\n'
-    in_stack scripts/xui.sh sub-links || warn "subscription URLs unavailable (is the stack running?)"
+    printf 'App name  : %s\n' "$(env_get "$envf" APP_NAME)"
+    printf 'Listening : http://%s:%s/ (published on %s)\n' "$host" "$port" "$bind"
+    [[ -z "$base" ]] || printf 'Public URL: %s/\n' "$base"
+    printf 'Random data (size 0-500000 bytes): http://%s:%s/random-%s?size=1000\n' "$host" "$port" "$rsuffix"
+    printf 'Files     : %s (login.html: restart after editing; other files are served as is)\n' "$(fakeapp_data_dir)"
 }
 
 # --- commands -----------------------------------------------------------------------------------------
 
 require_installed() {
-    getent passwd "$VPN_USER" >/dev/null || die "user $VPN_USER does not exist; run: sudo ./vpn.sh deploy"
-    init_paths
-    [[ -f "$VPN_DIR/docker-compose.yml" ]] || die "$VPN_DIR/docker-compose.yml not found; run: sudo ./vpn.sh deploy"
-    [[ -f "$VPN_DIR/.env" ]] || die "$VPN_DIR/.env not found; run: sudo ./vpn.sh deploy"
-    if ((EUID != 0)) && [[ "$(id -un)" != "$VPN_USER" ]]; then
-        die "run as root or as $VPN_USER"
-    fi
+    [[ -f "$VPN_DIR/docker-compose.yml" ]] || die "$VPN_DIR/docker-compose.yml not found; run: sudo ./vpn.sh install"
+    [[ -f "$VPN_DIR/.env" ]] || die "$VPN_DIR/.env not found; run: sudo ./vpn.sh install"
 }
 
-# --- automatic link hosts (systemd user timer) -------------------------------------
-
-HOSTS_UNIT=vpn-hosts
-
-hosts_service_content() {
-    cat <<EOF
-# Managed by vpn.sh: adds DOMAIN:443 link hosts to XHTTP inbounds created in
-# the 3X-UI panel (scripts/xui.sh auto-hosts). Existing hosts are not changed.
-[Unit]
-Description=Add 3X-UI link hosts for new XHTTP inbounds
-After=docker.service
-
-[Service]
-Type=oneshot
-WorkingDirectory=$VPN_DIR
-Environment=DOCKER_HOST=unix://%t/docker.sock
-Environment=XUI_API_TOKEN_NAME=vpn-auto-hosts
-ExecStart=/usr/bin/env bash scripts/xui.sh auto-hosts
-EOF
-}
-
-hosts_timer_content() {
-    cat <<'EOF'
-# Managed by vpn.sh.
-[Unit]
-Description=Add 3X-UI link hosts for new XHTTP inbounds every minute
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-EOF
-}
-
-# install_hosts_timer: write/refresh the user units and enable the timer.
-install_hosts_timer() {
-    local cfg="$VPN_HOME/.config/systemd/user"
-    as_vpn mkdir -p "$cfg"
-    hosts_service_content | as_vpn tee "$cfg/$HOSTS_UNIT.service" >/dev/null
-    hosts_timer_content | as_vpn tee "$cfg/$HOSTS_UNIT.timer" >/dev/null
-    as_vpn systemctl --user daemon-reload
-    as_vpn systemctl --user enable --now "$HOSTS_UNIT.timer" >/dev/null 2>&1 ||
-        die "could not enable $HOSTS_UNIT.timer for $VPN_USER"
-    ok "link hosts for new XHTTP inbounds are added automatically ($HOSTS_UNIT.timer, every minute)"
-}
-
-disable_hosts_timer() {
-    as_vpn systemctl --user disable --now "$HOSTS_UNIT.timer" >/dev/null 2>&1 || true
-}
-
-cmd_deploy() {
-    require_root deploy
-    STEP_TOTAL=12
+cmd_install() {
+    require_root install
+    STEP_TOTAL=10
     init_paths
 
     step "Checking the system"
     check_os
     check_system_tools
     check_rootful_docker
-    firewall_note
 
     step "Installing packages (prerequisites and Docker CE)"
     install_packages
@@ -1161,42 +960,33 @@ cmd_deploy() {
     step "Preparing user $VPN_USER (subuid/subgid, lingering)"
     ensure_user
 
-    step "Configuring unprivileged ports and AppArmor"
-    configure_sysctl
+    step "Configuring AppArmor for rootlesskit"
+    configure_apparmor
 
     step "Installing rootless Docker for $VPN_USER"
     install_rootless_docker
 
-    step "Copying the project to $VPN_DIR"
-    sync_project
+    step "Checking the project directory"
+    check_project
 
     step "Preparing .env"
     setup_env
 
-    step "Checking DNS"
-    check_dns "$(env_get "$VPN_DIR/.env" DOMAIN)"
+    step "Preparing the port and the data directory (login.html, favicon.ico)"
+    configure_port "$(fakeapp_port)"
+    prepare_data_dir
 
-    step "Bootstrapping data directories and placeholder certificate"
-    in_stack scripts/certs.sh bootstrap
-
-    step "Building and starting the stack"
+    step "Building and starting fakeapp"
     in_stack docker compose up -d --build --wait
 
-    step "Configuring the panel, inbounds, subscriptions, issuing the certificate"
-    in_stack scripts/xui.sh configure-panel
-    in_stack scripts/xui.sh provision
-    in_stack scripts/xui.sh configure-sub
-    in_stack scripts/certs.sh issue
-    install_hosts_timer
-
     CURRENT_STEP="summary"
-    printf '\n%sDeploy finished.%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '\n%sInstall finished.%s\n' "$C_BOLD" "$C_RESET" >&2
     print_summary
 }
 
 cmd_start() {
     require_installed
-    info "starting the stack"
+    info "starting fakeapp"
     ensure_docker_running
     in_stack docker compose up -d --wait
 }
@@ -1204,59 +994,8 @@ cmd_start() {
 cmd_stop() {
     require_installed
     ensure_docker_running
-    info "stopping the stack"
+    info "stopping fakeapp"
     in_stack docker compose stop
-}
-
-cmd_restart() {
-    cmd_stop
-    cmd_start
-}
-
-cmd_status() {
-    require_installed
-    ensure_docker_running
-    in_stack docker compose ps
-    printf '\n'
-    in_stack scripts/certs.sh status || warn "certificate status unavailable"
-}
-
-# genkeys: print a fresh x25519 key pair, a client UUID and two REALITY short
-# ids for configuring inbounds/clients in the panel by hand. Writes nothing.
-cmd_genkeys() {
-    require_installed
-    ensure_docker_running
-    local out line priv="" pub="" uuid="" sid1 sid2
-    out="$(in_stack scripts/xui.sh genkeys)" || die "key generation failed"
-    while IFS= read -r line; do
-        case "$line" in
-            REALITY_PRIVATE_KEY=*) priv="${line#*=}" ;;
-            REALITY_PUBLIC_KEY=*) pub="${line#*=}" ;;
-            CLIENT_UUID=*) uuid="${line#*=}" ;;
-        esac
-    done <<<"$out"
-    [[ -n "$priv" && -n "$pub" && -n "$uuid" ]] || die "unexpected output from genkeys"
-    # Two distinct short ids, each 4-8 random bytes (8-16 hex characters).
-    sid1="$(od -An -N"$(rand_int 4 8)" -tx1 /dev/urandom | tr -d ' \n')"
-    sid2="$sid1"
-    while [[ "$sid2" == "$sid1" ]]; do
-        sid2="$(od -An -N"$(rand_int 4 8)" -tx1 /dev/urandom | tr -d ' \n')"
-    done
-    printf 'Private key : %s\n' "$priv"
-    printf 'Public key  : %s\n' "$pub"
-    printf 'UUID        : %s\n' "$uuid"
-    printf 'Short ID 1  : %s\n' "$sid1"
-    printf 'Short ID 2  : %s\n' "$sid2"
-    printf '\nNothing was written. Panel: REALITY inbound -> Private Key / Public Key,\nShort IDs "%s,%s"; client -> ID (UUID).\n' "$sid1" "$sid2"
-}
-
-cmd_links() {
-    require_installed
-    # Adds DOMAIN:443 link hosts for XHTTP inbounds created in the panel since
-    # the last run (existing hosts are not changed), so their panel and
-    # subscription links work. Its log goes to stderr.
-    in_stack scripts/xui.sh configure-hosts >&2 || warn "could not update the link hosts (is the stack running?)"
-    print_summary
 }
 
 remove_data_dir() { # PATH: delete a directory that may contain subuid-owned files
@@ -1274,27 +1013,24 @@ remove_data_dir() { # PATH: delete a directory that may contain subuid-owned fil
 cmd_remove() {
     require_root remove
     STEP_TOTAL=$((PURGE ? 6 : 1))
-    getent passwd "$VPN_USER" >/dev/null || die "user $VPN_USER does not exist; nothing to remove"
-    init_paths
-    local domain=""
-    domain="$(env_get "$VPN_DIR/.env" DOMAIN)"
+    local data_dir=""
+    [[ -f "$VPN_DIR/.env" ]] && data_dir="$(fakeapp_data_dir)"
 
     if ((PURGE)); then
-        warn "--purge deletes ALL data: certificates, panel database, $VPN_DIR, rootless Docker and user $VPN_USER."
+        warn "--purge deletes ${data_dir:+the data in $data_dir and }the rootless Docker of $VPN_USER with ALL its images and containers."
         if ((ASSUME_YES)); then
             info "confirmation skipped (--yes)"
         else
             [[ -t 0 ]] || die "no terminal; re-run with --yes to purge"
-            local ans want="${domain:-yes}"
-            read -r -p "Type '$want' (or 'yes') to confirm: " ans || die "aborted"
-            [[ "$ans" == "$want" || "$ans" == yes ]] || die "aborted"
+            local ans
+            read -r -p "Type 'yes' to confirm: " ans || die "aborted"
+            [[ "$ans" == yes ]] || die "aborted"
         fi
     else
-        confirm "Stop and remove the containers and built images of the stack?" || die "aborted"
+        confirm "Stop and remove the fakeapp container and its built image?" || die "aborted"
     fi
 
-    step "Removing containers and images"
-    disable_hosts_timer
+    step "Removing the container and the image"
     if [[ -f "$VPN_DIR/docker-compose.yml" && -f "$VPN_DIR/.env" ]] && docker_up_or_start; then
         local -a down=(docker compose down --remove-orphans --rmi local)
         ((PURGE)) && down+=(--volumes)
@@ -1304,25 +1040,21 @@ cmd_remove() {
     fi
 
     if ((!PURGE)); then
-        info "data in $VPN_DIR/data and rootless Docker were kept (use --purge to delete them)"
+        info "data${data_dir:+ in $data_dir} and rootless Docker were kept (use --purge to delete them)"
         return 0
     fi
 
-    step "Deleting the project and data ($VPN_DIR)"
+    step "Deleting the data${data_dir:+ ($data_dir)}"
+    [[ -z "$data_dir" ]] || remove_data_dir "$data_dir"
     as_vpn systemctl --user stop docker.service >/dev/null 2>&1 || true
-    remove_data_dir "$VPN_DIR"
 
     step "Uninstalling rootless Docker"
     as_vpn dockerd-rootless-setuptool.sh uninstall >&2 || warn "setuptool uninstall reported an error"
     remove_data_dir "$VPN_HOME/.local/share/docker"
     rm -rf "$VPN_HOME/.config/systemd/user/docker.service.d"
-    rm -f "$VPN_HOME/.config/systemd/user/$HOSTS_UNIT.service" "$VPN_HOME/.config/systemd/user/$HOSTS_UNIT.timer"
 
-    step "Removing the user $VPN_USER"
+    step "Disabling lingering for $VPN_USER"
     loginctl disable-linger "$VPN_USER" || true
-    loginctl terminate-user "$VPN_USER" >/dev/null 2>&1 || true
-    sleep 2
-    userdel -r "$VPN_USER" || warn "userdel reported an error; check $VPN_HOME and /etc/subuid"
 
     step "Removing system configuration"
     if [[ -f "$SYSCTL_FILE" ]] && grep -q "$MANAGED_MARK" "$SYSCTL_FILE"; then
@@ -1353,7 +1085,7 @@ main() {
                 ;;
             -y | --yes) ASSUME_YES=1 ;;
             --purge) PURGE=1 ;;
-            deploy | start | stop | restart | status | links | genkeys | remove)
+            install | start | stop | remove)
                 [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
                 cmd="$1"
                 ;;
@@ -1366,8 +1098,6 @@ main() {
         exit 2
     }
     ((!PURGE)) || [[ "$cmd" == remove ]] || die "--purge only applies to 'remove'"
-    [[ "$VPN_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid VPN_USER '$VPN_USER'"
-
     trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
     init_paths
     "cmd_$cmd"

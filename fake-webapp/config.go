@@ -22,16 +22,15 @@ type Config struct {
 	// LoginDelayMin/Max bound the random delay of POST /login.
 	LoginDelayMin time.Duration
 	LoginDelayMax time.Duration
-	// FaviconFile is an optional replacement for the built-in blank favicon.
-	FaviconFile string
 	// envErr is the first parse error of the numeric variables.
 	envErr error
 	// RandomSuffix makes the data endpoint /random-<suffix>.
 	RandomSuffix string
-	// PageSeed selects the generated page variant; PageFile is where the
-	// (editable) page template is stored. Empty PageFile means memory only.
-	PageSeed string
-	PageFile string
+	// PageSeed seeds headers and error pages. LoginFile is the login page
+	// template (read once at start); StaticDir is served read-only.
+	PageSeed  string
+	LoginFile string
+	StaticDir string
 }
 
 var (
@@ -103,10 +102,10 @@ func loadConfig() Config {
 		GlobalRate:    float64(global),
 		LoginDelayMin: time.Duration(dmin) * time.Millisecond,
 		LoginDelayMax: time.Duration(dmax) * time.Millisecond,
-		FaviconFile:   getenv("FAVICON_FILE", "/data/favicon.ico"),
 		envErr:        envErr,
 		RandomSuffix:  os.Getenv("RANDOM_DATA_SUFFIX"),
 		PageSeed:      os.Getenv("PAGE_SEED"),
-		PageFile:      getenv("PAGE_FILE", "/data/page.html"),
+		LoginFile:     getenv("LOGIN_FILE", "/data/login.html"),
+		StaticDir:     getenv("STATIC_DIR", "/data"),
 	}
 }

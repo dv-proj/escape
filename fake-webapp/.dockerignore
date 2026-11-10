@@ -4,3 +4,6 @@ Dockerfile
 *_test.go
 README.md
 fake-webapp
+gen
+docker-compose.yml
+testdata

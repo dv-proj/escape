@@ -4,12 +4,14 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -45,7 +47,7 @@ type App struct {
 	throttle *loginThrottle
 	hdr      *headerProfile
 	errs     *errorPages
-	icon     *favicon
+	static   *os.Root
 	// sleep waits for d or until ctx is done; delay picks the login delay.
 	sleep  func(ctx context.Context, d time.Duration)
 	delay  func() time.Duration
@@ -59,6 +61,10 @@ func NewApp(cfg Config, now Clock) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := os.OpenRoot(cfg.StaticDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open STATIC_DIR: %w", err)
+	}
 	a := &App{
 		cfg: cfg, now: now, page: page,
 		global:   newBucket(cfg.GlobalRate, cfg.GlobalRate, now),
@@ -66,7 +72,7 @@ func NewApp(cfg Config, now Clock) (*App, error) {
 		throttle: newLoginThrottle(now),
 		hdr:      newHeaderProfile(cfg.PageSeed),
 		errs:     newErrorPages(cfg.PageSeed),
-		icon:     loadFavicon(cfg.FaviconFile, now()),
+		static:   root,
 		sleep:    sleepCtx,
 	}
 	a.delay = func() time.Duration { return loginDelay(cfg.LoginDelayMin, cfg.LoginDelayMax, rand.NormFloat64()) }
@@ -135,11 +141,6 @@ type nonceKey struct{}
 
 func (a *App) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/favicon.ico" {
-			w.Header().Set("X-Content-Type-Options", "nosniff")
-			next.ServeHTTP(w, r)
-			return
-		}
 		nonce := a.hdr.newNonce()
 		a.hdr.apply(w.Header(), nonce)
 		next.ServeHTTP(w, r.WithContext(withNonce(r, nonce)))
@@ -187,10 +188,9 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 		a.renderPage(w, r, http.StatusOK, "")
 	case r.URL.Path == "/login" && r.Method == http.MethodPost:
 		a.login(w, r)
-	case r.URL.Path == "/favicon.ico" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-		a.icon.serve(w, r)
 	case r.URL.Path == "/random-"+a.cfg.RandomSuffix && r.Method == http.MethodGet:
 		a.randomData(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && a.serveStatic(w, r):
 	default:
 		code := http.StatusFound
 		if r.Method == http.MethodPost {

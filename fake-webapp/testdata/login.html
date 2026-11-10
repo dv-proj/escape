@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1" name="viewport">
+<meta name="twitter:card" content="summary">
+<meta property="og:description" content="{{.Description}}">
+<style nonce="{{.Nonce}}">
+* { box-sizing: border-box; }
+h1 { color: #0f3d91; margin: 0 0 4px; font-size: 24px; }
+.el-ee7db7 { font-size: 13px; color: #4b5563; }
+.el-a785c { font-size: 15px; width: 100%; font-weight: 600; cursor: pointer; border-radius: 6px; margin-top: 22px; background: #2563eb; color: #fff; padding: 11px; border: 0; }
+.el-61d6c { margin: 0 0 6px; border-radius: 6px; border: 1px solid #fecaca; font-size: 14px; background: #fef2f2; padding: 10px 12px; color: #b91c1c; }
+.el-791f63 { margin-top: 14px; display: flex; gap: 8px; align-items: center; }
+.el-bf31 { font-weight: 600; display: block; margin: 14px 0 6px; font-size: 13px; }
+.el-ef74c9 { margin: 0; width: 16px; height: 16px; }
+.el-cacb4 { margin: 16px; padding: 36px 32px; box-shadow: 0 8px 30px rgba(15,23,42,.1); max-width: 380px; width: 100%; background: #fff; border-radius: 10px; }
+.el-30bf { border: 1px solid #cbd5e1; padding: 10px 12px; font-size: 15px; width: 100%; border-radius: 6px; }
+.el-60c1 { margin: 24px 0 0; color: #6b7280; font-size: 12px; text-align: center; }
+.el-30bf:focus { border-color: #2563eb; outline: 2px solid #bcd0f7; }
+body { font-family: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; align-items: center; justify-content: center; margin: 0; display: flex; color: #1f2937; min-height: 100vh; background: #f3f5f9; }
+.el-163b3 { text-align: center; margin: 20px 0 0; font-size: 12px; color: #9ca3af; }
+.el-a785c:hover { background: #1d4ed8; }
+.el-a79dd6 { font-size: 14px; color: #6b7280; margin: 0 0 24px; }
+</style>
+<meta content="{{.Keywords}}" name="keywords">
+<meta name="robots" content="index,follow">
+<meta property="og:title" content="{{.AppName}}">
+<script type="application/ld+json" nonce="{{.Nonce}}">{{.JSONLD}}</script>
+<meta name="twitter:title" content="{{.AppName}}">
+<meta name="twitter:description" content="{{.Description}}">
+{{if .BaseURL}}<link rel="canonical" href="{{.BaseURL}}">{{end}}
+<meta property="og:type" content="website">
+<meta content="{{.Description}}" name="description">
+<title>{{.AppName}}</title>
+{{if .BaseURL}}<meta property="og:url" content="{{.BaseURL}}">{{end}}
+</head>
+<body>
+<main class="el-cacb4">
+<h1>{{.AppName}}</h1>
+<p class="el-a79dd6">Enter your credentials to continue</p>
+{{if .State}}
+<p class="el-61d6c" role="alert">
+{{if eq .State "throttled"}}Too many requests for this account. Please try again later.{{else}}Sorry, the credentials you entered are incorrect. Please try again.{{end}}
+</p>
+{{end}}
+{{if not .HideForm}}
+<form method="post" action="/login" autocomplete="on">
+<label class="el-bf31" for="el-8251">Username</label>
+<input required type="text" class="el-30bf" autocomplete="username" id="el-8251" name="username">
+<label for="el-35f9e" class="el-bf31">Your password</label>
+<input id="el-35f9e" required name="password" type="password" autocomplete="current-password" class="el-30bf">
+<div class="el-791f63">
+<input type="checkbox" id="el-d0236" name="rm" class="el-ef74c9">
+<label for="el-d0236" class="el-ee7db7">Remember this device</label>
+</div>
+<button class="el-a785c" type="submit">Sign in to account</button>
+</form>
+{{end}}
+<p class="el-60c1">Server time: <span id="el-fbbe0" data-off="{{.OffsetSec}}" data-ts="{{.UnixMilli}}">{{.Time}}</span></p>
+<div class="el-163b3">All systems operational.</div>
+</main>
+<script nonce="{{.Nonce}}">
+(function(){
+const dolosek1=document.getElementById("el-fbbe0");
+const batux9=Date.now()-Number(dolosek1.dataset.ts);
+const teflin4=Number(dolosek1.dataset.off)*1000;
+function visesa3(n){return (n<10?"0":"")+n}
+function plizevul5(){
+const d=new Date(Date.now()-batux9+teflin4);
+dolosek1.textContent=d.getUTCFullYear()+"-"+visesa3(d.getUTCMonth()+1)+"-"+visesa3(d.getUTCDate())+" "+visesa3(d.getUTCHours())+":"+visesa3(d.getUTCMinutes())+":"+visesa3(d.getUTCSeconds());
+}
+plizevul5();
+setInterval(plizevul5,1000);
+})();
+</script>
+</body>
+</html>

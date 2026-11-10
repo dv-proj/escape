@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,9 +39,35 @@ func testConfig() Config {
 
 // newTestApp builds an app with generous limits; the login delay is recorded
 // in app.slept instead of being waited for.
+var (
+	loginOnce sync.Once
+	loginPath string
+)
+
+// sharedLogin writes a generated login page into a process-wide temp dir.
+func sharedLogin() string {
+	loginOnce.Do(func() {
+		d, err := os.MkdirTemp("", "fakewebapp-test")
+		if err != nil {
+			panic(err)
+		}
+		loginPath = filepath.Join(d, "login.html")
+		// testdata/login.html: python3 gen/login.py --seed <testSeed> --out testdata/login.html
+		page, err := os.ReadFile(filepath.Join("testdata", "login.html"))
+		if err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(loginPath, page, 0o644); err != nil {
+			panic(err)
+		}
+	})
+	return loginPath
+}
+
 func newTestAppCfg(mod func(*Config)) (*App, *fakeClock, http.Handler) {
 	clk := &fakeClock{t: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
 	cfg := testConfig()
+	cfg.LoginFile, cfg.StaticDir = sharedLogin(), filepath.Dir(sharedLogin())
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -265,47 +292,125 @@ func TestIPLimiterBounded(t *testing.T) {
 	}
 }
 
-func TestFavicon(t *testing.T) {
-	_, _, h := newTestApp(0)
-	for _, m := range []string{"GET", "HEAD"} {
-		rec := do(h, m, "/favicon.ico", nil)
-		if rec.Code != 200 || rec.Header().Get("Content-Type") != "image/x-icon" || rec.Header().Get("Cache-Control") != "public, max-age=86400" {
-			t.Fatalf("%s: %d %v", m, rec.Code, rec.Header())
-		}
-		if m == "GET" && (rec.Body.Len() != 1150 || !bytes.HasPrefix(rec.Body.Bytes(), []byte{0, 0, 1, 0, 1, 0})) {
-			t.Errorf("bad ico: %d bytes", rec.Body.Len())
-		}
-		if m == "HEAD" && rec.Body.Len() != 0 {
-			t.Error("HEAD body")
-		}
-		if rec.Header().Get("Content-Security-Policy") != "" {
-			t.Error("CSP on favicon")
-		}
+func writeFile(t *testing.T, p, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	etag := do(h, "GET", "/favicon.ico", nil).Header().Get("ETag")
-	req := httptest.NewRequest("GET", "/favicon.ico", nil)
-	req.Header.Set("If-None-Match", etag)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if etag == "" || rec.Code != 304 {
-		t.Errorf("etag %q conditional: %d", etag, rec.Code)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestFaviconFile(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "favicon.ico")
-	custom := []byte("\x89PNG\r\n\x1a\n custom icon")
-	if err := os.WriteFile(p, custom, 0o644); err != nil {
+// staticApp returns a handler serving a fresh static dir.
+func staticApp(t *testing.T) (string, http.Handler) {
+	t.Helper()
+	dir := t.TempDir()
+	_, _, h := newTestAppCfg(func(c *Config) { c.StaticDir = dir })
+	return dir, h
+}
+
+func TestLoginFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{"empty": "", "blank": " \n", "invalid": "{{if}}", "badfield": "<p>{{.Nope}}</p>"} {
+		p := filepath.Join(dir, name+".html")
+		writeFile(t, p, content)
+		cfg := testConfig()
+		cfg.LoginFile, cfg.StaticDir = p, dir
+		if _, err := NewApp(cfg, time.Now); err == nil || !strings.Contains(err.Error(), "gen/login.py") {
+			t.Errorf("%s: err %v", name, err)
+		}
+	}
+	cfg := testConfig()
+	cfg.LoginFile, cfg.StaticDir = filepath.Join(dir, "missing.html"), dir
+	if _, err := NewApp(cfg, time.Now); err == nil || !strings.Contains(err.Error(), "gen/login.py") {
+		t.Errorf("missing: %v", err)
+	}
+	cfg.LoginFile, cfg.StaticDir = sharedLogin(), filepath.Join(dir, "nodir")
+	if _, err := NewApp(cfg, time.Now); err == nil {
+		t.Error("missing static dir accepted")
+	}
+}
+
+func TestStaticServed(t *testing.T) {
+	dir, h := staticApp(t)
+	writeFile(t, filepath.Join(dir, "app.css"), "body{}")
+	writeFile(t, filepath.Join(dir, "a/b/c.css"), "x{}")
+	writeFile(t, filepath.Join(dir, "blob.zzunknown"), "data")
+	rec := do(h, "GET", "/app.css", nil)
+	if rec.Code != 200 || rec.Body.String() != "body{}" || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/css") ||
+		rec.Header().Get("Cache-Control") != "no-cache" || rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
+		rec.Header().Get("Content-Security-Policy") == "" || rec.Header().Get("Last-Modified") == "" {
+		t.Fatalf("%d %v", rec.Code, rec.Header())
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag")
+	}
+	req := httptest.NewRequest("GET", "/app.css", nil)
+	req.Header.Set("If-None-Match", etag)
+	r2 := httptest.NewRecorder()
+	h.ServeHTTP(r2, req)
+	if r2.Code != 304 {
+		t.Errorf("conditional: %d", r2.Code)
+	}
+	if rec := do(h, "HEAD", "/app.css", nil); rec.Code != 200 || rec.Body.Len() != 0 || rec.Header().Get("ETag") != etag {
+		t.Errorf("HEAD: %d len %d", rec.Code, rec.Body.Len())
+	}
+	if rec := do(h, "GET", "/a/b/c.css", nil); rec.Code != 200 || rec.Body.String() != "x{}" {
+		t.Errorf("subdir: %d", rec.Code)
+	}
+	if rec := do(h, "GET", "/blob.zzunknown", nil); rec.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("fallback type %q", rec.Header().Get("Content-Type"))
+	}
+	// Edits are visible immediately and change the ETag.
+	writeFile(t, filepath.Join(dir, "app.css"), "body{color:red}")
+	rec = do(h, "GET", "/app.css", nil)
+	if rec.Body.String() != "body{color:red}" || rec.Header().Get("ETag") == etag {
+		t.Errorf("edit not visible: %q %q", rec.Body.String(), rec.Header().Get("ETag"))
+	}
+	if rec := do(h, "POST", "/app.css", nil); rec.Code != 303 {
+		t.Errorf("POST: %d", rec.Code)
+	}
+}
+
+func TestStaticNotServed(t *testing.T) {
+	dir, h := staticApp(t)
+	writeFile(t, filepath.Join(dir, ".secret"), "s")
+	writeFile(t, filepath.Join(dir, ".hid/x.txt"), "s")
+	writeFile(t, filepath.Join(dir, "a/.x.txt"), "s")
+	writeFile(t, filepath.Join(dir, "login.html"), "s")
+	writeFile(t, filepath.Join(dir, "index.html"), "s")
+	writeFile(t, filepath.Join(dir, "sub/ok.txt"), "s")
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "out.txt"), "outside")
+	if err := os.Symlink(filepath.Join(outside, "out.txt"), filepath.Join(dir, "link.txt")); err != nil {
+		t.Skip(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "linkdir")); err != nil {
 		t.Fatal(err)
 	}
-	_, _, h := newTestAppCfg(func(c *Config) { c.FaviconFile = p })
-	rec := do(h, "GET", "/favicon.ico", nil)
-	if rec.Code != 200 || !bytes.Equal(rec.Body.Bytes(), custom) || rec.Header().Get("Content-Type") != "image/png" {
-		t.Errorf("custom favicon not served: %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	for _, p := range []string{"/.secret", "/.hid/x.txt", "/a/.x.txt", "/login.html", "/LOGIN.HTML", "/Login.Html", "/sub", "/sub/", "/index.html/", "//app.css",
+		"/../out.txt", "/sub/../../out.txt", "/%2e%2e/out.txt", "/sub/%2e%2e/ok.txt", "/link.txt", "/linkdir/out.txt", "/nosuch", "/favicon.ico"} {
+		rec := do(h, "GET", p, nil)
+		if rec.Code != 302 || rec.Header().Get("Location") != "/" || rec.Body.Len() != 0 {
+			t.Errorf("%s: %d %q", p, rec.Code, rec.Body.String())
+		}
 	}
-	_, _, h = newTestAppCfg(func(c *Config) { c.FaviconFile = filepath.Join(t.TempDir(), "none.ico") })
-	if rec := do(h, "GET", "/favicon.ico", nil); rec.Code != 200 || rec.Body.Len() != 1150 {
-		t.Errorf("missing file fallback: %d %d", rec.Code, rec.Body.Len())
+	if rec := do(h, "GET", "/sub/ok.txt", nil); rec.Code != 200 {
+		t.Errorf("control: %d", rec.Code)
+	}
+}
+
+func TestFaviconStatic(t *testing.T) {
+	dir, h := staticApp(t)
+	if rec := do(h, "GET", "/favicon.ico", nil); rec.Code != 302 {
+		t.Errorf("absent: %d", rec.Code)
+	}
+	writeFile(t, filepath.Join(dir, "favicon.ico"), "\x00\x00\x01\x00 icon")
+	rec := do(h, "GET", "/favicon.ico", nil)
+	if rec.Code != 200 || !bytes.HasPrefix(rec.Body.Bytes(), []byte{0, 0, 1, 0}) || rec.Header().Get("Content-Type") == "" {
+		t.Errorf("present: %d %v", rec.Code, rec.Header())
 	}
 }
 
