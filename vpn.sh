@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# vpn.sh - install and manage the decoy web application (fake-webapp) with
-# rootless Docker on Ubuntu/Debian.
+# vpn.sh - install and manage the decoy web application (fake-webapp) behind
+# an nginx TLS proxy (Let's Encrypt via certbot) with rootless Docker on
+# Ubuntu/Debian.
 #
 # Run `./vpn.sh --help` for usage. The service itself is defined in
-# fake-webapp/docker-compose.yml (included by docker-compose.yml); this script
+# fake-webapp/docker-compose.yml and nginx/docker-compose.yml (included by
+# docker-compose.yml); this script
 # prepares the host (packages, unprivileged user, rootless Docker), copies the
 # project to the user's home, generates .env and starts the container.
+# Optionally it also runs a Telegram WEB-proxy (Telemt, WEB transport) on a
+# subdomain of DOMAIN; its users are managed with `vpn.sh webproxy user ...`.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +25,11 @@ VPN_UID=""
 SYSCTL_FILE=/etc/sysctl.d/99-vpn-rootless.conf
 APPARMOR_FILE=/etc/apparmor.d/usr.bin.rootlesskit
 MANAGED_MARK="# managed by vpn.sh"
+# Host ports published by the nginx service (nginx/docker-compose.yml).
+PUBLIC_PORTS=(80 443)
+# Telemt (default web.limits.max_profiles) accepts at most this many users.
+WEBPROXY_MAX_USERS=32
+WP_ARGS=()
 
 PREREQ_PKGS=(uidmap dbus-user-session slirp4netns fuse-overlayfs curl ca-certificates iproute2 iptables python3)
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin)
@@ -69,25 +78,37 @@ usage() {
     cat <<'EOF'
 Usage: ./vpn.sh [options] <command>
 
-Installs and manages the decoy web application (fake-webapp) using rootless
-Docker of the invoking user (the one who runs `sudo ./vpn.sh install`). No
+Installs and manages the decoy web application (fake-webapp) behind an nginx
+TLS proxy on ports 80/443 (Let's Encrypt certificate for DOMAIN, obtained
+and renewed by certbot) using rootless Docker of the invoking user (the one who runs `sudo ./vpn.sh install`). No
 users are created; the project, .env and data stay in this directory.
 Target systems: Ubuntu 24.04+ and Debian 12+.
 
 Commands:
   install   Idempotent setup (sudo/root): packages, rootless Docker for the
-            invoking user, .env generation, generation of the missing
-            login.html and favicon.ico, build and start of the fakeapp
-            container. Re-running rebuilds/restarts the container; existing
+            invoking user, firewall rules for 80/443 TCP, .env generation,
+            generation of the missing login.html and favicon.ico, build and
+            start of the containers (fakeapp, nginx, certbot and, when
+            WEBPROXY_SUBDOMAIN is set, the webproxy). Re-running rebuilds/restarts the container; existing
             .env values and files in the data directory are never changed.
-  start     Start the container (docker compose up -d --wait).
-  stop      Stop the container (docker compose stop).
-  remove    Remove the container and the built image (sudo/root). With
+  start     Start the containers (docker compose up -d --wait).
+  stop      Stop the containers (docker compose stop).
+  remove    Remove the containers and the built images (sudo/root). With
             --purge also deletes the data directory (login.html, favicon.ico
-            and your static files), the rootless Docker install of the user
+            and your static files), the Docker volumes (including the TLS
+            certificates), the rootless Docker install of the user
             (all its images and containers!), lingering and the
             sysctl/AppArmor files. The project directory, .env and packages
             are never removed.
+  webproxy user add <name>    Add a user of the Telegram WEB-proxy (random
+                              secret), regenerate its config and restart it.
+  webproxy user del <name>    Delete a user (not the last one).
+  webproxy user list          List user names (no secrets).
+  webproxy user link <name>   Print the Telegram link of a user (contains the
+                              secret; treat it as a password).
+            These need WEBPROXY_SUBDOMAIN to be set in .env (a label such as
+            "static": the proxy answers on static.DOMAIN, DOMAIN must be a DNS
+            name) and run as the invoking user or via sudo.
 
 Options:
   -y, --yes   Assume "yes" for every confirmation (OS warning, disabling a
@@ -96,7 +117,8 @@ Options:
   -h, --help  Show this help.
 
 Environment:
-  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, DOMAIN
+  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, DOMAIN, ACME_EMAIL,
+  WEBPROXY_SUBDOMAIN, WEBPROXY_PUBLIC_IP
               If set when .env is created by `install`, they are used without
               prompting. Unset APP_* values are generated at random (offered
               as defaults when interactive). Without a terminal, all other
@@ -107,8 +129,22 @@ Notes:
     run rootless Docker); start/stop run as that user or via sudo.
   * An existing .env is reused: values are never changed; keys that
     are new in .env.example are appended with their description comments.
-  * The app is published on FAKEAPP_BIND:FAKEAPP_PORT from .env (default
-    127.0.0.1:8080, plain HTTP). Firewall rules are not touched.
+  * nginx listens on 80/443 TCP of the host and routes everything to fakeapp
+    (port 80 redirects to https when DOMAIN is set). install opens 80/443
+    TCP in ufw/firewalld when active, else in iptables when INPUT is not
+    open. fakeapp listens on FAKEAPP_PORT (default 8080, plain HTTP) in its
+    container and is published on FAKEAPP_BIND:FAKEAPP_PORT (default
+    127.0.0.1); nginx proxies to fakeapp:FAKEAPP_PORT.
+  * Certificates are kept in the shared Docker volume tls-certs
+    (TLS_CERTS_VOLUME) so other containers can mount and reuse them.
+  * Telegram WEB-proxy: install asks for WEBPROXY_SUBDOMAIN (empty = off) and
+    WEBPROXY_PUBLIC_IP (IPv4 clients reach on 443), sets COMPOSE_PROFILES in
+    .env and creates the user "user1" on the first run. You must create a DNS
+    A record <WEBPROXY_SUBDOMAIN>.<DOMAIN> -> WEBPROXY_PUBLIC_IP yourself (it
+    is not checked). Users live in WEBPROXY_DATA_DIR/users ("name secret"
+    lines, mode 0600); the Telemt config is generated from it. To turn the
+    feature off, clear WEBPROXY_SUBDOMAIN and re-run install (the webproxy
+    container is removed; the user data is kept).
 EOF
 }
 
@@ -225,6 +261,25 @@ valid_text() {
 }
 valid_tz() { [[ "$1" =~ ^[A-Za-z0-9_+/-]{1,64}$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (($1 >= 1 && $1 <= 65535)); }
+# valid_email VALUE: empty (no e-mail) or a plain address safe for .env.
+valid_email() {
+    [[ -z "$1" ]] && return 0
+    valid_text "$1" && [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
+}
+# DNS label of the WEB-proxy subdomain (lowercase).
+valid_label() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
+# valid_ipv4 VALUE: four dotted decimal octets 0-255.
+valid_ipv4() {
+    local -a o
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -ra o <<<"$1"
+    local x
+    for x in "${o[@]}"; do ((10#$x <= 255)) || return 1; done
+}
+# valid_wp_user VALUE: name of a WEB-proxy user (also a safe TOML bare key).
+valid_wp_user() { [[ "$1" =~ ^[a-z0-9_-]{1,32}$ ]]; }
+# is_ip VALUE: IPv4 or IPv6 address (no Let's Encrypt certificate for these).
+is_ip() { [[ "$1" == *:* || "$1" =~ ^[0-9.]+$ ]]; }
 
 # rand_str LENGTH CHARSET: random string from /dev/urandom.
 rand_str() {
@@ -304,8 +359,72 @@ ask_domain() {
     ENV_VALUES[DOMAIN]="$v"
 }
 
+# ask_acme_email [ENVFILE]: optional ACME_EMAIL (Let's Encrypt account
+# contact) into ENV_VALUES[ACME_EMAIL]. Only asked when the domain
+# (ENV_VALUES[DOMAIN], else DOMAIN from ENVFILE) is a DNS name: from the
+# environment if set; else asked when interactive (empty allowed); else empty.
+ask_acme_email() {
+    local domain="${ENV_VALUES[DOMAIN]-}" v=""
+    [[ -n "$domain" || -z "${1:-}" ]] || domain="$(env_get "$1" DOMAIN)"
+    if [[ -z "$domain" ]] || is_ip "$domain"; then
+        ENV_VALUES[ACME_EMAIL]=""
+        return 0
+    fi
+    if [[ -n "${ACME_EMAIL:-}" ]]; then
+        valid_email "$ACME_EMAIL" || die "ACME_EMAIL from the environment is invalid: expected an e-mail address"
+        v="$ACME_EMAIL"
+        info "ACME_EMAIL (from environment): $v"
+    elif [[ -t 0 ]]; then
+        while :; do
+            read -r -p "E-mail for the Let's Encrypt certificate of $domain (empty: none): " v || die "no input"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            valid_email "$v" && break
+            warn "invalid value; expected an e-mail address like admin@example.com or nothing"
+        done
+    fi
+    ENV_VALUES[ACME_EMAIL]="$v"
+}
+
+# ask_webproxy_subdomain [ENVFILE]: WEBPROXY_SUBDOMAIN (a DNS label, empty =
+# feature off) into ENV_VALUES. Only asked when the domain (ENV_VALUES[DOMAIN],
+# else DOMAIN from ENVFILE) is a DNS name: from the environment if set; else
+# asked when interactive (empty allowed); else empty. Not checked in DNS.
+ask_webproxy_subdomain() {
+    local domain="${ENV_VALUES[DOMAIN]-}" v="" from_env=0
+    [[ -n "$domain" || -z "${1:-}" ]] || domain="$(env_get "$1" DOMAIN)"
+    if [[ -z "$domain" ]] || is_ip "$domain"; then
+        [[ -z "${WEBPROXY_SUBDOMAIN:-}" ]] || warn "WEBPROXY_SUBDOMAIN ignored: DOMAIN must be a DNS name"
+        ENV_VALUES[WEBPROXY_SUBDOMAIN]=""
+        return 0
+    fi
+    if [[ -n "${WEBPROXY_SUBDOMAIN:-}" ]]; then
+        from_env=1
+        v="$WEBPROXY_SUBDOMAIN"
+    elif [[ -t 0 ]]; then
+        while :; do
+            read -r -p "Subdomain for the Telegram WEB-proxy, e.g. static for static.$domain (empty: no proxy): " v || die "no input"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            [[ -z "$v" ]] || valid_label "${v,,}" && break
+            warn "invalid value; expected a single DNS label like static (a-z, 0-9, -)"
+        done
+    fi
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    v="${v,,}"
+    if [[ -n "$v" ]] && ! valid_label "$v"; then
+        die "WEBPROXY_SUBDOMAIN is invalid: expected a single DNS label like static"
+    fi
+    if ((from_env)); then info "WEBPROXY_SUBDOMAIN (from environment): $v"; fi
+    ENV_VALUES[WEBPROXY_SUBDOMAIN]="$v"
+}
+
 # Keys of .env.example that may stay empty.
-is_optional_key() { [[ "$1" == DOMAIN ]]; }
+is_optional_key() {
+    [[ "$1" == DOMAIN || "$1" == ACME_EMAIL || "$1" == WEBPROXY_SUBDOMAIN ||
+        "$1" == WEBPROXY_PUBLIC_IP || "$1" == COMPOSE_PROFILES ]]
+}
 
 # --- generated values -------------------------------------------------------------------
 
@@ -428,6 +547,25 @@ ensure_generated_key() {
     info "added missing $key to $file"
 }
 
+# env_set FILE KEY VALUE: set KEY=VALUE in place (all existing KEY= lines are
+# replaced, else it is appended); other lines are untouched. Keeps mode/owner.
+env_set() {
+    local file=$1 key=$2 val=$3 tmp line found=0
+    tmp="$(mktemp "$file.XXXXXX")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^${key}= ]]; then
+            printf '%s=%s\n' "$key" "$(fmt_env_value "$val")" >>"$tmp"
+            found=1
+        else
+            printf '%s\n' "$line" >>"$tmp"
+        fi
+    done <"$file"
+    ((found)) || printf '%s=%s\n' "$key" "$(fmt_env_value "$val")" >>"$tmp"
+    chmod --reference="$file" "$tmp"
+    if [[ $EUID -eq 0 ]]; then chown --reference="$file" "$tmp"; fi
+    mv -f "$tmp" "$file"
+}
+
 # env_has FILE KEY: KEY= line exists (even with an empty value).
 env_has() { grep -Eq "^[[:space:]]*$2=" "$1"; }
 
@@ -476,6 +614,12 @@ sync_env_with_example() {
         elif [[ "$key" == DOMAIN ]]; then
             ask_domain
             val="${ENV_VALUES[DOMAIN]}"
+        elif [[ "$key" == ACME_EMAIL ]]; then
+            ask_acme_email "$envf"
+            val="${ENV_VALUES[ACME_EMAIL]}"
+        elif [[ "$key" == WEBPROXY_SUBDOMAIN ]]; then
+            ask_webproxy_subdomain "$envf"
+            val="${ENV_VALUES[WEBPROXY_SUBDOMAIN]}"
         elif is_optional_key "$key"; then
             val=""
         else
@@ -506,6 +650,8 @@ generate_env() {
     ask APP_DESCRIPTION "Decoy site description" "$GEN_APP_DESCRIPTION" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_KEYWORDS "Decoy site keywords" "$GEN_APP_KEYWORDS" valid_text "1-200 characters without ' \" \$ \` \\"
     ask_domain
+    ask_acme_email
+    ask_webproxy_subdomain
     def_tz="$(host_timezone)"
     # TZ is deliberately not read from the environment (often set to odd values).
     local saved_tz="${TZ-__unset__}"
@@ -773,6 +919,70 @@ EOF
     ok "net.ipv4.ip_unprivileged_port_start=$port ($SYSCTL_FILE)"
 }
 
+# lowest_port: the lowest host port the stack publishes (nginx and fakeapp).
+lowest_port() {
+    local p min
+    min="$(fakeapp_port)"
+    for p in "${PUBLIC_PORTS[@]}"; do ((p < min)) && min=$p; done
+    printf '%s' "$min"
+}
+
+# _iptables_open CMD: accept PUBLIC_PORTS/tcp in CMD (iptables or ip6tables)
+# when its INPUT chain is not wide open. Returns 0 if rules were added.
+_iptables_open() {
+    local cmd=$1 p rules added=0
+    command -v "$cmd" >/dev/null 2>&1 || return 1
+    rules="$("$cmd" -S INPUT 2>/dev/null)" || return 1
+    # Policy ACCEPT and no rules: nothing is filtered.
+    [[ "$rules" != "-P INPUT ACCEPT" ]] || return 1
+    for p in "${PUBLIC_PORTS[@]}"; do
+        if ! "$cmd" -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+            "$cmd" -I INPUT -p tcp --dport "$p" -j ACCEPT
+            added=1
+        fi
+    done
+    ((added))
+}
+
+# open_firewall_ports: allow PUBLIC_PORTS/tcp. Rootless Docker publishes ports
+# from a user process (no Docker iptables rules), so the host firewall applies.
+open_firewall_ports() {
+    local p done_any=0 changed=0 ports="${PUBLIC_PORTS[*]}"
+    ports="${ports// //tcp, }/tcp"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        for p in "${PUBLIC_PORTS[@]}"; do
+            ufw allow "$p/tcp" comment vpn.sh >/dev/null
+        done
+        ok "ufw: allowed $ports"
+        done_any=1
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for p in "${PUBLIC_PORTS[@]}"; do
+            firewall-cmd --quiet --permanent --add-port="$p/tcp" 2>/dev/null || true
+        done
+        firewall-cmd --quiet --reload
+        ok "firewalld: allowed $ports"
+        done_any=1
+    fi
+    if ((!done_any)); then
+        if _iptables_open iptables; then changed=1; fi
+        if _iptables_open ip6tables; then changed=1; fi
+        if ((changed)); then
+            ok "iptables: accepted $ports in INPUT"
+            if ! command -v netfilter-persistent >/dev/null 2>&1; then
+                warn "these iptables rules are lost on reboot; make them permanent with your firewall tooling"
+            elif netfilter-persistent save >/dev/null 2>&1; then
+                ok "rules saved (netfilter-persistent)"
+            else
+                warn "could not save the rules with netfilter-persistent"
+            fi
+        else
+            ok "no active host firewall filters $ports (ufw/firewalld inactive, INPUT open)"
+        fi
+    fi
+    info "a cloud provider firewall / security group, if any, must allow $ports too"
+}
+
 install_rootless_docker() {
     local cfg="$VPN_HOME/.config/systemd/user"
     local dropin_dir="$cfg/docker.service.d" dropin="$cfg/docker.service.d/vpn-rootless.conf"
@@ -854,8 +1064,10 @@ check_project() {
     local owner
     owner="$(stat -c %U "$VPN_DIR")"
     [[ "$owner" == "$VPN_USER" ]] || die "$VPN_DIR is owned by $owner, not $VPN_USER; clone the project as $VPN_USER"
-    [[ -f "$VPN_DIR/docker-compose.yml" && -f "$VPN_DIR/fake-webapp/docker-compose.yml" ]] ||
-        die "docker-compose.yml or fake-webapp/docker-compose.yml missing in $VPN_DIR"
+    local f
+    for f in docker-compose.yml fake-webapp/docker-compose.yml nginx/docker-compose.yml; do
+        [[ -f "$VPN_DIR/$f" ]] || die "$f missing in $VPN_DIR"
+    done
     ok "project: $VPN_DIR"
 }
 
@@ -880,6 +1092,8 @@ fakeapp_port() {
     p="$(env_get "$VPN_DIR/.env" FAKEAPP_PORT)"
     p="${p:-8080}"
     valid_port "$p" || die "FAKEAPP_PORT in $VPN_DIR/.env must be 1-65535 (got '$p')"
+    [[ " ${PUBLIC_PORTS[*]} " != *" $p "* ]] ||
+        die "FAKEAPP_PORT=$p in $VPN_DIR/.env clashes with nginx (ports ${PUBLIC_PORTS[*]}); pick another port"
     printf '%s' "$p"
 }
 
@@ -921,7 +1135,382 @@ prepare_data_dir() {
     ok "$d is readable for the container (mounted read-only)"
 }
 
+# --- Telegram WEB-proxy (Telemt, WEB transport) ---------------------------------------------
+
+# Resolved by wp_load: WP_FQDN WP_IP WP_NGINX_IP WP_DIR WP_USERS_FILE; users by wp_users_load.
+WP_FQDN="" WP_IP="" WP_NGINX_IP="" WP_DIR="" WP_USERS_FILE=""
+WP_NAMES=()
+WP_SECRETS=()
+
+# wp_run CMD...: run as the VPN user when we are root (files must belong to it).
+wp_run() {
+    if ((EUID == 0)); then as_vpn "$@"; else "$@"; fi
+}
+
+# wp_data_dir: host data directory (default ./data/webproxy, relative paths
+# resolve against the project directory).
+wp_data_dir() {
+    local d
+    d="$(env_get "$VPN_DIR/.env" WEBPROXY_DATA_DIR)"
+    d="${d:-../data/webproxy}"
+    # Relative to webproxy/, like the compose volume that mounts it.
+    [[ "$d" == /* ]] || d="$VPN_DIR/webproxy/$d"
+    realpath -m "$d"
+}
+
+# wp_load: read the feature settings from .env into WP_*; dies when it is off
+# or misconfigured.
+wp_load() {
+    local envf="$VPN_DIR/.env" sub domain
+    sub="$(env_get "$envf" WEBPROXY_SUBDOMAIN)"
+    [[ -n "$sub" ]] ||
+        die "the Telegram WEB-proxy is off (WEBPROXY_SUBDOMAIN is empty in $envf); set it and re-run: sudo ./vpn.sh install"
+    sub="${sub,,}"
+    valid_label "$sub" || die "WEBPROXY_SUBDOMAIN in $envf must be a single DNS label like static (got '$sub')"
+    domain="$(env_get "$envf" DOMAIN)"
+    domain="${domain,,}"
+    [[ -n "$domain" ]] && ! is_ip "$domain" || die "WEBPROXY_SUBDOMAIN needs DOMAIN to be a DNS name (DOMAIN='$domain')"
+    WP_FQDN="$sub.$domain"
+    WP_IP="$(env_get "$envf" WEBPROXY_PUBLIC_IP)"
+    valid_ipv4 "$WP_IP" || die "WEBPROXY_PUBLIC_IP in $envf must be an IPv4 address (got '$WP_IP'); re-run: sudo ./vpn.sh install"
+    WP_NGINX_IP="$(env_get "$envf" WEBPROXY_NGINX_IP)"
+    WP_NGINX_IP="${WP_NGINX_IP:-172.30.53.2}"
+    valid_ipv4 "$WP_NGINX_IP" || die "WEBPROXY_NGINX_IP in $envf must be an IPv4 address"
+    WP_DIR="$(wp_data_dir)"
+    WP_USERS_FILE="$WP_DIR/users"
+    WP_RELOAD="$(env_get "$envf" WEBPROXY_RELOAD)"
+    WP_RELOAD="${WP_RELOAD:-hot}"
+    [[ "$WP_RELOAD" == hot || "$WP_RELOAD" == recreate ]] ||
+        die "WEBPROXY_RELOAD in $envf must be hot or recreate (got '$WP_RELOAD')"
+}
+
+# wp_default_ip FQDN: first IPv4 the name resolves to, else the source address
+# of the default route (may print nothing).
+wp_default_ip() {
+    local v=""
+    v="$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+    valid_ipv4 "$v" || v="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+    valid_ipv4 "$v" || v=""
+    printf '%s' "$v"
+}
+
+# profiles_update CURRENT WANT(0|1): COMPOSE_PROFILES with "webproxy" added or removed.
+profiles_update() {
+    local -a ps=() out=()
+    local p
+    IFS=, read -ra ps <<<"$1"
+    for p in "${ps[@]}"; do
+        p="${p#"${p%%[![:space:]]*}"}"
+        p="${p%"${p##*[![:space:]]}"}"
+        [[ -z "$p" || "$p" == webproxy ]] || out+=("$p")
+    done
+    if (($2)); then out+=(webproxy); fi
+    local IFS=,
+    printf '%s' "${out[*]}"
+}
+
+# wp_write_atomic DEST (content on stdin): temp file in the same directory
+# (mode 0600, owned by the VPN user) renamed over DEST; refuses symlinks and
+# non-regular files.
+wp_write_atomic() {
+    local dest=$1 dir tmp
+    dir="$(dirname "$dest")"
+    [[ -d "$dir" && ! -L "$dir" ]] || die "$dir is not a plain directory"
+    [[ ! -L "$dest" ]] || die "$dest is a symlink; refusing to write"
+    [[ ! -e "$dest" || -f "$dest" ]] || die "$dest is not a regular file"
+    tmp="$(wp_run mktemp "$dir/.tmp.XXXXXX" </dev/null)" || die "cannot create a temporary file in $dir"
+    if ! wp_run tee "$tmp" >/dev/null || ! wp_run chmod 0600 "$tmp" || ! wp_run mv -f -T "$tmp" "$dest"; then
+        wp_run rm -f "$tmp" || true
+        die "cannot write $dest"
+    fi
+}
+
+# wp_users_load: read WP_USERS_FILE into WP_NAMES / WP_SECRETS (validated).
+wp_users_load() {
+    WP_NAMES=()
+    WP_SECRETS=()
+    [[ -e "$WP_USERS_FILE" ]] || return 0
+    [[ -f "$WP_USERS_FILE" && ! -L "$WP_USERS_FILE" ]] || die "$WP_USERS_FILE is not a regular file"
+    local line n s extra lineno=0 x
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        if [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]]; then continue; fi
+        n="" s="" extra=""
+        read -r n s extra <<<"$line"
+        valid_wp_user "$n" && [[ "$s" =~ ^[0-9a-f]{32}$ && -z "$extra" ]] ||
+            die "invalid line $lineno in $WP_USERS_FILE (expected: name secret)"
+        for x in "${WP_NAMES[@]}"; do
+            [[ "$x" != "$n" ]] || die "duplicate user '$n' in $WP_USERS_FILE"
+        done
+        WP_NAMES+=("$n")
+        WP_SECRETS+=("$s")
+    done <"$WP_USERS_FILE"
+}
+
+# wp_user_index NAME: print the index of NAME in WP_NAMES (status 1: absent).
+wp_user_index() {
+    local i
+    for i in "${!WP_NAMES[@]}"; do
+        if [[ "${WP_NAMES[i]}" == "$1" ]]; then
+            printf '%s' "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# wp_secure_dirs: data directory and telemt/ subdirectory, mode 0700.
+wp_secure_dirs() {
+    [[ ! -L "$WP_DIR" && ! -L "$WP_DIR/telemt" ]] || die "$WP_DIR (or its telemt/) is a symlink; refusing to use it"
+    wp_run mkdir -p "$WP_DIR/telemt" || die "cannot create $WP_DIR/telemt"
+    wp_run chmod 0700 "$WP_DIR" "$WP_DIR/telemt" || die "cannot chmod $WP_DIR"
+}
+
+# wp_config_render: the Telemt config.toml for the loaded users on stdout.
+wp_config_render() {
+    local i
+    cat <<EOT
+# Generated by vpn.sh from $WP_USERS_FILE; do not edit.
+# Notes:
+#  - links are not printed to logs (they contain secrets): use
+#    ./vpn.sh webproxy user link <name>.
+#  - no public-IP detection requests (public_addr is given below).
+#  - [server] port is an unpublished high port, only in case Telemt also
+#    starts a classic listener; only the WEB listener below is published
+#    (through nginx).
+#  - the control API is disabled (it would listen on 0.0.0.0:9091).
+#  - the FakeTLS mask target is unused in WEB-only mode.
+#  - decoy = the internal nginx listener that 302-redirects to https://DOMAIN.
+#  - Telemt hot-reloads this file, but vpn.sh also restarts the service.
+[general]
+use_middle_proxy = false
+
+[general.links]
+show = []
+
+[network]
+stun_use = false
+http_ip_detect_urls = []
+
+[censorship]
+mask = false
+
+[server]
+port = 18443
+
+[server.api]
+enabled = false
+
+[access.users]
+EOT
+    for i in "${!WP_NAMES[@]}"; do
+        printf '%s = "%s"\n' "${WP_NAMES[i]}" "${WP_SECRETS[i]}"
+    done
+    cat <<EOT
+
+[[server.listeners]]
+ip = "0.0.0.0"
+port = 18080
+transport = "web"
+proxy_protocol = false
+reuse_allow = false
+web_client_ip_source = "x_forwarded_for"
+web_trusted_proxy_cidrs = ["$WP_NGINX_IP/32"]
+
+[web]
+enabled = true
+carrier = "https"
+
+[[web.vhosts]]
+host = "$WP_FQDN"
+public_addr = "$WP_IP:443"
+
+[web.vhosts.decoy]
+mode = "http_upstream"
+upstream = "http://$WP_NGINX_IP:8081"
+EOT
+    for i in "${!WP_NAMES[@]}"; do
+        printf '\n[[web.vhosts.profiles]]\nuser = "%s"\nsecret_mode = "dd"\n' "${WP_NAMES[i]}"
+    done
+}
+
+# wp_write_config: regenerate telemt/config.toml from the loaded users.
+wp_write_config() {
+    local content
+    ((${#WP_NAMES[@]} >= 1)) || die "no WEB-proxy users; Telemt needs at least one"
+    content="$(wp_config_render)"
+    wp_write_atomic "$WP_DIR/telemt/config.toml" <<<"$content"
+}
+
+# wp_write_users: write WP_NAMES/WP_SECRETS to the users file, then the config.
+wp_write_users() {
+    local content="" i
+    for i in "${!WP_NAMES[@]}"; do
+        content+="${WP_NAMES[i]} ${WP_SECRETS[i]}"$'\n'
+    done
+    wp_write_atomic "$WP_USERS_FILE" <<<"${content%$'\n'}"
+    wp_write_config
+}
+
+# wp_user_add NAME: add a user with a random secret (no service restart).
+wp_user_add() {
+    valid_wp_user "$1" || die "invalid user name '$1': use 1-32 characters from a-z 0-9 _ -"
+    wp_secure_dirs
+    wp_users_load
+    if wp_user_index "$1" >/dev/null; then die "user '$1' already exists"; fi
+    ((${#WP_NAMES[@]} < WEBPROXY_MAX_USERS)) ||
+        die "Telemt allows at most $WEBPROXY_MAX_USERS WEB-proxy users; delete one first"
+    WP_NAMES+=("$1")
+    WP_SECRETS+=("$(rand_str 32 '0-9a-f')")
+    wp_write_users
+}
+
+# wp_user_del NAME: delete a user (no service restart); never the last one.
+wp_user_del() {
+    local idx i
+    local -a n=() s=()
+    wp_users_load
+    idx="$(wp_user_index "$1")" || die "no such user '$1'"
+    ((${#WP_NAMES[@]} > 1)) ||
+        die "'$1' is the last user and Telemt needs at least one; to turn the proxy off clear WEBPROXY_SUBDOMAIN in .env and re-run: sudo ./vpn.sh install"
+    for i in "${!WP_NAMES[@]}"; do
+        ((i == idx)) || { n+=("${WP_NAMES[i]}"); s+=("${WP_SECRETS[i]}"); }
+    done
+    WP_NAMES=("${n[@]}")
+    WP_SECRETS=("${s[@]}")
+    wp_write_users
+}
+
+# wp_print_link NAME: the Telegram links of a user (they contain the secret).
+wp_print_link() {
+    local idx
+    idx="$(wp_user_index "$1")" || die "no such user '$1'"
+    printf 'tg://webproxy?server=%s&secret=dd%s\n' "$WP_FQDN" "${WP_SECRETS[idx]}"
+    printf 'https://t.me/webproxy?server=%s&secret=dd%s\n' "$WP_FQDN" "${WP_SECRETS[idx]}"
+}
+
+# wp_prepare: directories, the first user (user1) when there are none, config.
+wp_prepare() {
+    wp_secure_dirs
+    wp_users_load
+    if ((${#WP_NAMES[@]} == 0)); then
+        wp_user_add user1
+        ok "created the first WEB-proxy user: user1"
+    else
+        wp_write_config
+        ok "$WP_DIR/telemt/config.toml regenerated (${#WP_NAMES[@]} users)"
+    fi
+}
+
+# setup_webproxy: install step. Public IP, COMPOSE_PROFILES, data and config
+# (feature on) or COMPOSE_PROFILES cleanup (feature off).
+setup_webproxy() {
+    local envf="$VPN_DIR/.env" sub ip cur
+    sub="$(env_get "$envf" WEBPROXY_SUBDOMAIN)"
+    cur="$(env_get "$envf" COMPOSE_PROFILES)"
+    if [[ -z "$sub" ]]; then
+        env_set "$envf" COMPOSE_PROFILES "$(profiles_update "$cur" 0)"
+        info "Telegram WEB-proxy is off (WEBPROXY_SUBDOMAIN is empty); the old webproxy container is removed when the stack starts"
+        return 0
+    fi
+    sub="${sub,,}"
+    valid_label "$sub" || die "WEBPROXY_SUBDOMAIN in $envf must be a single DNS label like static (got '$sub')"
+    ip="$(env_get "$envf" WEBPROXY_PUBLIC_IP)"
+    if [[ -z "$ip" ]]; then
+        local domain
+        domain="$(env_get "$envf" DOMAIN)"
+        ENV_VALUES=()
+        ask WEBPROXY_PUBLIC_IP "Public IPv4 of this host that clients reach on 443" \
+            "$(wp_default_ip "$sub.${domain,,}")" valid_ipv4 "an IPv4 address like 203.0.113.10"
+        ip="${ENV_VALUES[WEBPROXY_PUBLIC_IP]}"
+        env_set "$envf" WEBPROXY_PUBLIC_IP "$ip"
+    fi
+    env_set "$envf" COMPOSE_PROFILES "$(profiles_update "$cur" 1)"
+    wp_load
+    warn "create a DNS A record yourself: $WP_FQDN -> $WP_IP (not checked)"
+    wp_prepare
+}
+
+# wp_running: the webproxy service is up.
+wp_running() {
+    docker_ready && [[ -n "$(in_stack docker compose ps -q --status running webproxy 2>/dev/null)" ]]
+}
+
+# wp_apply_start: remember the time before the config is rewritten, so that
+# wp_apply finds only the reload caused by this change in the logs.
+wp_apply_start() { WP_APPLY_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
+
+# wp_apply: make the running webproxy service use the new config.
+#  hot      - Telemt re-reads config.toml by itself (inotify + polling): added
+#             users work at once, sessions of deleted users are closed, other
+#             sessions stay. Waits for "config reload" in the log; if it does
+#             not appear, falls back to recreate.
+#  recreate - recreate the container: every client reconnects.
+wp_apply() {
+    local i
+    if ! wp_running; then
+        info "the webproxy service is not running; the change applies at the next start"
+        return 0
+    fi
+    if [[ "$WP_RELOAD" == hot ]]; then
+        for ((i = 0; i < 15; i++)); do
+            if in_stack docker compose logs --no-color --since "${WP_APPLY_SINCE:-1m}" webproxy 2>/dev/null |
+                grep -q 'config reload'; then
+                ok "the webproxy service reloaded its config (no restart)"
+                return 0
+            fi
+            sleep 1
+        done
+        warn "no config reload seen in the webproxy log within 15s; recreating the service"
+    fi
+    info "recreating the webproxy service (clients reconnect)"
+    in_stack docker compose up -d --force-recreate --no-deps --wait webproxy
+}
+
+cmd_webproxy() {
+    local sub="${WP_ARGS[0]-}" action="${WP_ARGS[1]-}" name="${WP_ARGS[2]-}"
+    [[ "$sub" == user && -n "$action" ]] ||
+        die "usage: ./vpn.sh webproxy user add <name> | del <name> | list | link <name>"
+    require_installed
+    wp_load
+    case "$action" in
+        add)
+            [[ -n "$name" ]] || die "usage: ./vpn.sh webproxy user add <name>"
+            wp_apply_start
+            wp_user_add "$name"
+            ok "user $name added"
+            wp_apply
+            wp_print_link "$name"
+            ;;
+        del)
+            [[ -n "$name" ]] || die "usage: ./vpn.sh webproxy user del <name>"
+            wp_apply_start
+            wp_user_del "$name"
+            ok "user $name deleted"
+            wp_apply
+            ;;
+        list)
+            wp_users_load
+            ((${#WP_NAMES[@]})) || info "no users"
+            ((${#WP_NAMES[@]} == 0)) || printf '%s\n' "${WP_NAMES[@]}"
+            ;;
+        link)
+            [[ -n "$name" ]] || die "usage: ./vpn.sh webproxy user link <name>"
+            wp_users_load
+            wp_print_link "$name"
+            ;;
+        *) die "unknown action '$action' (add, del, list, link)" ;;
+    esac
+}
+
 # --- summary ---------------------------------------------------------------------------------------
+
+tls_volume() {
+    local v
+    v="$(env_get "$VPN_DIR/.env" TLS_CERTS_VOLUME)"
+    printf '%s' "${v:-tls-certs}"
+}
 
 print_summary() {
     local envf="$VPN_DIR/.env" bind port rsuffix domain host
@@ -935,9 +1524,30 @@ print_summary() {
     printf '\n'
     printf 'App name  : %s\n' "$(env_get "$envf" APP_NAME)"
     printf 'Listening : http://%s:%s/ (published on %s)\n' "$host" "$port" "$bind"
-    [[ -z "$domain" ]] || printf 'Public URL: https://%s/ (canonical link and og:url)\n' "$domain"
+    if [[ -z "$domain" ]]; then
+        printf 'Public URL: https://<server address>/ (nginx on 80/443 -> fakeapp, self-signed certificate)\n'
+    elif is_ip "$domain"; then
+        printf 'Public URL: https://%s/ (nginx on 80/443 -> fakeapp, self-signed certificate)\n' "$domain"
+    else
+        printf 'Public URL: https://%s/ (nginx on 80/443 -> fakeapp; canonical link and og:url)\n' "$domain"
+        printf "TLS       : Let's Encrypt certificate is requested in the background (docker compose logs certbot)\n"
+    fi
+    printf 'Certs     : Docker volume %s (/etc/letsencrypt layout; mount it to reuse)\n' "$(tls_volume)"
     printf 'Random data (size 0-500000 bytes): http://%s:%s/random-%s?size=1000\n' "$host" "$port" "$rsuffix"
     printf 'Files     : %s (login.html: restart after editing; other files are served as is)\n' "$(fakeapp_data_dir)"
+    if [[ -n "$(env_get "$envf" WEBPROXY_SUBDOMAIN)" ]]; then
+        wp_load
+        wp_users_load
+        printf 'WEB-proxy : https://%s/ (Telegram WEB-proxy, %s user(s) in %s)\n' "$WP_FQDN" "${#WP_NAMES[@]}" "$WP_USERS_FILE"
+        printf 'DNS record: %s A %s (create it yourself; not checked)\n' "$WP_FQDN" "$WP_IP"
+        if ((${#WP_NAMES[@]})); then
+            printf 'Link (%s): ' "${WP_NAMES[0]}"
+            wp_print_link "${WP_NAMES[0]}" | head -n1
+            printf '            more: ./vpn.sh webproxy user add|del|list|link\n'
+        fi
+    else
+        printf 'WEB-proxy : off (set WEBPROXY_SUBDOMAIN in .env and re-run install to enable)\n'
+    fi
 }
 
 # --- commands -----------------------------------------------------------------------------------------
@@ -949,7 +1559,7 @@ require_installed() {
 
 cmd_install() {
     require_root install
-    STEP_TOTAL=10
+    STEP_TOTAL=12
     init_paths
 
     step "Checking the system"
@@ -978,11 +1588,21 @@ cmd_install() {
     step "Preparing .env"
     setup_env
 
-    step "Preparing the port and the data directory (login.html, favicon.ico)"
-    configure_port "$(fakeapp_port)"
+    step "Preparing the ports and the data directory (login.html, favicon.ico)"
+    configure_port "$(lowest_port)"
     prepare_data_dir
 
-    step "Building and starting fakeapp"
+    step "Configuring the Telegram WEB-proxy"
+    setup_webproxy
+
+    step "Opening ports ${PUBLIC_PORTS[*]} TCP in the firewall"
+    open_firewall_ports
+
+    step "Building and starting fakeapp, nginx, certbot and the webproxy (if enabled)"
+    if [[ -z "$(env_get "$VPN_DIR/.env" WEBPROXY_SUBDOMAIN)" ]]; then
+        in_stack docker compose --profile webproxy rm -sf webproxy ||
+            warn "could not remove an old webproxy container (ignored if there is none)"
+    fi
     in_stack docker compose up -d --build --wait
 
     CURRENT_STEP="summary"
@@ -992,7 +1612,7 @@ cmd_install() {
 
 cmd_start() {
     require_installed
-    info "starting fakeapp"
+    info "starting fakeapp, nginx and certbot"
     ensure_docker_running
     in_stack docker compose up -d --wait
 }
@@ -1000,7 +1620,7 @@ cmd_start() {
 cmd_stop() {
     require_installed
     ensure_docker_running
-    info "stopping fakeapp"
+    info "stopping fakeapp, nginx and certbot"
     in_stack docker compose stop
 }
 
@@ -1020,10 +1640,14 @@ cmd_remove() {
     require_root remove
     STEP_TOTAL=$((PURGE ? 6 : 1))
     local data_dir=""
-    [[ -f "$VPN_DIR/.env" ]] && data_dir="$(fakeapp_data_dir)"
+    local wp_dir=""
+    if [[ -f "$VPN_DIR/.env" ]]; then
+        data_dir="$(fakeapp_data_dir)"
+        wp_dir="$(wp_data_dir)"
+    fi
 
     if ((PURGE)); then
-        warn "--purge deletes ${data_dir:+the data in $data_dir and }the rootless Docker of $VPN_USER with ALL its images and containers."
+        warn "--purge deletes ${data_dir:+the data in $data_dir, }the TLS certificates (volumes) and the rootless Docker of $VPN_USER with ALL its images and containers."
         if ((ASSUME_YES)); then
             info "confirmation skipped (--yes)"
         else
@@ -1033,10 +1657,10 @@ cmd_remove() {
             [[ "$ans" == yes ]] || die "aborted"
         fi
     else
-        confirm "Stop and remove the fakeapp container and its built image?" || die "aborted"
+        confirm "Stop and remove the containers and their built images (certificates are kept)?" || die "aborted"
     fi
 
-    step "Removing the container and the image"
+    step "Removing the containers and the images"
     if [[ -f "$VPN_DIR/docker-compose.yml" && -f "$VPN_DIR/.env" ]] && docker_up_or_start; then
         local -a down=(docker compose down --remove-orphans --rmi local)
         ((PURGE)) && down+=(--volumes)
@@ -1046,12 +1670,13 @@ cmd_remove() {
     fi
 
     if ((!PURGE)); then
-        info "data${data_dir:+ in $data_dir} and rootless Docker were kept (use --purge to delete them)"
+        info "data${data_dir:+ in $data_dir}, certificates (volume $(tls_volume)) and rootless Docker were kept (use --purge to delete them)"
         return 0
     fi
 
     step "Deleting the data${data_dir:+ ($data_dir)}"
     [[ -z "$data_dir" ]] || remove_data_dir "$data_dir"
+    [[ -z "$wp_dir" ]] || remove_data_dir "$wp_dir"
     as_vpn systemctl --user stop docker.service >/dev/null 2>&1 || true
 
     step "Uninstalling rootless Docker"
@@ -1094,6 +1719,13 @@ main() {
             install | start | stop | remove)
                 [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
                 cmd="$1"
+                ;;
+            webproxy)
+                [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
+                cmd=webproxy
+                shift
+                WP_ARGS=("$@")
+                break
                 ;;
             *) die "unknown argument '$1' (see --help)" ;;
         esac

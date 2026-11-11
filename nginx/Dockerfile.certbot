@@ -1,0 +1,3 @@
+FROM certbot/certbot:v5.9.0
+COPY --chmod=755 certbot.sh /usr/local/bin/certbot-loop.sh
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/certbot-loop.sh"]
