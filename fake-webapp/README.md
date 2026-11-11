@@ -47,4 +47,4 @@ Healthcheck: `fake-webapp -healthcheck` (GET `/` on localhost, exit 0 on 200).
 
 Test: `go test ./...`. Build: `docker build -t fake-webapp .`
 
-Compose: `docker-compose.yml` here defines the `fakeapp` service for `include:` from a main compose file (variables come from the including project's `.env`; data directory `${FAKEAPP_DATA_DIR:-../data/fakeapp}`, published on `${FAKEAPP_BIND:-127.0.0.1}:${FAKEAPP_PORT:-8080}`).
+Compose: `docker-compose.yml` here defines the `fakeapp` service for `include:` from a main compose file (variables come from the including project's `.env`; data directory `${FAKEAPP_DATA_DIR:-../data/fakeapp}`, `LISTEN_ADDR` is `:${FAKEAPP_PORT:-8080}` and the same port is published on `${FAKEAPP_BIND:-127.0.0.1}`).

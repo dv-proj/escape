@@ -1,0 +1,56 @@
+# Telegram web proxy (Telemt server, WEB transport), optional.
+#
+# Enabled by the compose profile `webproxy` (COMPOSE_PROFILES=webproxy, set by
+# vpn.sh when WEBPROXY_SUBDOMAIN is configured). It is not published: nginx
+# (nginx/docker-compose.yml) terminates TLS for <WEBPROXY_SUBDOMAIN>.<DOMAIN>
+# and proxies the whole vhost to it over the `webproxy` network. Telemt sends
+# invalid requests to nginx's decoy listener (http://<WEBPROXY_NGINX_IP>:8081).
+#
+# Relative paths below are resolved against this directory (webproxy/).
+
+services:
+  webproxy:
+    image: ghcr.io/telemt/telemt:3.5.17
+    profiles: ["webproxy"]
+    command: ["/etc/telemt/config.toml"]
+    working_dir: /run/telemt
+    restart: unless-stopped
+    init: true
+    read_only: true
+    # Rootless Docker: container root is the unprivileged host user that runs
+    # the stack, and the config is 0600 owned by that user, so root is the
+    # only container user that can read it (no real privileges are involved).
+    user: "0:0"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "liveness"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - ${WEBPROXY_DATA_DIR:-../data/webproxy}/telemt:/etc/telemt:ro
+    tmpfs:
+      - /run/telemt
+    # No published ports. The network is not internal: Telemt needs outbound
+    # access to the Telegram data centers.
+    networks:
+      webproxy:
+        ipv4_address: ${WEBPROXY_TELEMT_IP:-172.30.53.3}
+
+networks:
+  # Shared with nginx/docker-compose.yml, which declares it identically
+  # (every included file is its own model, so each one must define it).
+  webproxy:
+    name: ${COMPOSE_PROJECT_NAME:-vpn}_webproxy
+    ipam:
+      config:
+        - subnet: ${WEBPROXY_SUBNET:-172.30.53.0/24}
