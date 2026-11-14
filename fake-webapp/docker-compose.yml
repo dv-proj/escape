@@ -8,7 +8,7 @@
 # Relative paths below are resolved against this directory (fake-webapp/).
 # Variables are interpolated from the including project's environment/.env
 # (see ../.env.example). Plain HTTP/h2c on FAKEAPP_PORT (default 8080): put a
-# TLS proxy in front.
+# TLS proxy (your nginx) in front.
 
 services:
   fakeapp:
@@ -25,7 +25,7 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
-      # Same port inside the container, on the host and in nginx (FAKEAPP_PORT).
+      # Same port inside the container and on the host (FAKEAPP_PORT).
       LISTEN_ADDR: ":${FAKEAPP_PORT:-8080}"
       APP_NAME: ${APP_NAME:?APP_NAME is required}
       APP_DESCRIPTION: ${APP_DESCRIPTION:-}
@@ -45,7 +45,7 @@ services:
       - "${FAKEAPP_BIND:-127.0.0.1}:${FAKEAPP_PORT:-8080}:${FAKEAPP_PORT:-8080}/tcp"
     volumes:
       # login.html (page template, required) and favicon.ico, created by
-      # gen/login.py and gen/favicon.py (`vpn.sh install` runs them), plus any
+      # gen/login.py and gen/favicon.py (`fakeapp.sh install` runs them), plus any
       # other files to serve as is (subdirectories allowed, hidden files not).
       # Read-only: the app never writes. Files need to be readable by "others"
       # (the container runs as a non-root uid): directories 755, files 644.

@@ -1,11 +1,7 @@
-name: vpn
+name: fakeapp
 
 # The decoy web application; its service definition lives in fake-webapp/.
-# nginx/ adds the TLS front proxy on 80/443 (routes to fakeapp by default)
-# and certbot with the shared certificate volume `tls-certs`.
-# webproxy/ is the optional Telegram web proxy (profile `webproxy`) that nginx
-# fronts on a subdomain.
+# It listens on FAKEAPP_BIND:FAKEAPP_PORT (default 127.0.0.1:8080, plain
+# HTTP/h2c): put your own TLS front (nginx in front of Xray / 3X-UI) before it.
 include:
   - fake-webapp/docker-compose.yml
-  - nginx/docker-compose.yml
-  - webproxy/docker-compose.yml
