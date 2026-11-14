@@ -1,6 +1,6 @@
 # fake-webapp
 
-Decoy corporate login page served to non-VPN visitors. Plain HTTP and h2c on `LISTEN_ADDR`; TLS is terminated by nginx.
+Decoy corporate login page served to non-VPN visitors. Plain HTTP and h2c on `LISTEN_ADDR`; TLS is terminated by your nginx in front of it.
 
 ## Environment
 

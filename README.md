@@ -1,160 +1,281 @@
-# escape: сайт-обманка (fake-webapp) в rootless Docker
+# escape: сайт-обманка fake-webapp рядом с Xray / 3X-UI
 
-Проект разворачивает три контейнера: `fakeapp` — правдоподобную страницу входа в веб-сервис (Go, `fake-webapp/`), `nginx` — TLS-прокси на портах 80/443 перед ним и `certbot` — получение и продление сертификата Let's Encrypt. Контейнеры работают в rootless Docker **текущего пользователя**: новые пользователи не создаются, проект, `.env` и данные остаются в каталоге, откуда запущен скрипт.
+Инструмент разворачивает на сервере с уже установленными Xray или 3X-UI один Docker-контейнер `fakeapp`. Это правдоподобная страница входа в веб-сервис (Go, исходники в `fake-webapp/`). Её видят обычные посетители и активные зонды, которые заходят на ваш домен без ключа VPN.
+
+Контейнер слушает только `127.0.0.1:<порт>` по обычному HTTP. TLS, сертификаты и маршрутизацию по-прежнему делают ваш nginx и Xray: fake-webapp просто ставится в nginx как upstream «для всего остального» (см. раздел [«Подключение к nginx»](#подключение-к-nginx)). Скрипт **не трогает** nginx, Xray, 3X-UI, сертификаты и файрвол.
 
 ## Состав
 
 | Файл | Назначение |
 |---|---|
+| `fakeapp.sh` | установка и управление |
 | `fake-webapp/` | исходники приложения, `Dockerfile`, описание (`fake-webapp/README.md`) |
 | `fake-webapp/gen/` | генераторы `login.py` и `favicon.py` (Python 3, только stdlib); запускаются на хосте, в образ не входят |
-| `fake-webapp/docker-compose.yml` | сервис `fakeapp`; подключается в любой compose-проект через `include` |
-| `nginx/` | TLS-прокси и получение сертификатов: `Dockerfile` (nginx), `Dockerfile.certbot`, `entrypoint.sh` (nginx), `certbot.sh` (цикл certbot) |
-| `nginx/docker-compose.yml` | сервисы `nginx` и `certbot`; подключается через `include` |
-| `webproxy/` | Telegram WEB-proxy на Telemt: `docker-compose.yml`, конфиг, описание (`webproxy/README.md`); включается настройкой `WEBPROXY_SUBDOMAIN` |
-| `docker-compose.yml` | основной файл: `include` для `fake-webapp/docker-compose.yml`, `nginx/docker-compose.yml` и `webproxy/docker-compose.yml` |
-| `.env.example` | шаблон настроек (копируется в `.env` при установке) |
-| `vpn.sh` | установка и управление |
-
-Подключение в другой проект:
-
-```yaml
-include:
-  - fake-webapp/docker-compose.yml
-```
-
-Все параметры — в одном файле: корневой `.env` основного проекта. Из него compose подставляет переменные и в `fakeapp`, и в остальные сервисы, в том числе подключённые через `include`. Относительные пути внутри `fake-webapp/docker-compose.yml` отсчитываются от `fake-webapp/`.
-
-## Каталог данных
-
-`./data/fakeapp` основного проекта (или `FAKEAPP_DATA_DIR`) монтируется в контейнер **только для чтения**: приложение ничего не пишет.
-
-| Файл | Откуда | Когда приложение видит изменения |
-|---|---|---|
-| `login.html` | `gen/login.py` (шаблон Go `html/template`), обязателен: без него или с битым шаблоном приложение не стартует | после перезапуска |
-| `favicon.ico` | `gen/favicon.py` (первая буква `APP_NAME`, оформление из `PAGE_SEED`) | сразу |
-| любые другие файлы и подкаталоги | кладёте сами; отдаются по пути `/<путь>` | сразу |
-
-Не отдаются: скрытые файлы и каталоги (`.*`), сам `/login.html`, каталоги (без листинга). Отсутствующий путь — редирект на `/`.
-
-Права: контейнер работает от непривилегированного uid, для ваших файлов это «прочие». Нужны `r` на файлах и `r-x` на каталогах (обычные 644/755). Владелец файлов — вы, правите их напрямую. `vpn.sh install` создаёт каталог от вашего имени, генерирует недостающие `login.html` и `favicon.ico` (существующие не трогает) и выполняет `chmod -R a+rX`. При подключении через `include` без `vpn.sh` сделайте то же вручную:
-
-```bash
-mkdir -p data/fakeapp
-```
-
-```bash
-python3 fake-webapp/gen/login.py --seed "$PAGE_SEED" --out data/fakeapp/login.html
-```
-
-```bash
-python3 fake-webapp/gen/favicon.py --seed "$PAGE_SEED" --name="$APP_NAME" --out data/fakeapp/favicon.ico
-```
-
-```bash
-chmod -R a+rX data/fakeapp
-```
-
-Новый вариант оформления: смените `PAGE_SEED`, удалите `login.html` и `favicon.ico` и снова запустите `sudo ./vpn.sh install`.
+| `fake-webapp/docker-compose.yml` | сервис `fakeapp` |
+| `docker-compose.yml` | основной файл (проект `fakeapp`): `include` для `fake-webapp/docker-compose.yml` |
+| `.env.example` | шаблон настроек; при установке копируется в `.env` |
 
 ## Требования
 
-- Ubuntu 24.04+ или Debian 12+, обычный пользователь с правом `sudo`.
-- Проект склонирован этим пользователем (каталог принадлежит ему).
-- `python3` (ставится `install`, если его нет).
-- Порты 80 и 443 TCP хоста свободны и доступны снаружи (для выдачи сертификата Let's Encrypt нужен порт 80, и `DOMAIN` должен указывать на этот хост).
+- Ubuntu 22.04+ или Debian 12+, права root (`sudo`).
+- Docker с плагином compose v2.20+. Если Docker уже стоит (например, на нём работает 3X-UI), используется он, его настройки не меняются. Если Docker нет, ставится Docker CE из `download.docker.com`. Если нет только плагина compose, ставится плагин.
+- `python3`, `curl`, `iproute2` (ставятся автоматически, если их нет).
+- nginx, через который сайт будет доступен снаружи: обычно он уже стоит рядом с Xray или 3X-UI.
+
+## Установка
+
+```bash
+git clone <url-репозитория> /opt/fakeapp
+```
+
+```bash
+cd /opt/fakeapp && sudo ./fakeapp.sh install
+```
+
+Скрипт задаёт только эти вопросы:
+
+| Вопрос | Ключ `.env` | По умолчанию |
+|---|---|---|
+| Название сайта | `APP_NAME` | случайное правдоподобное |
+| Описание сайта | `APP_DESCRIPTION` | случайное, в тон названию |
+| Ключевые слова | `APP_KEYWORDS` | случайные, в тон названию |
+| DNS-имя сайта без протокола (необязательно) | `DOMAIN` | пусто |
+| Локальный порт приложения | `FAKEAPP_PORT` | первый свободный порт начиная с 8080 |
+| Часовой пояс | `TZ` | часовой пояс хоста |
+
+- **`DOMAIN`** нужен только для тегов `canonical` и `og:url` (`https://<DOMAIN>`). Сертификат для него скрипт не запрашивает.
+- **`FAKEAPP_PORT`** не должен совпадать с портами Xray, панели 3X-UI и nginx. Скрипт проверяет, что порт свободен.
+
+Остальные параметры генерируются случайно: `PAGE_SEED` (вариант оформления), `RANDOM_DATA_SUFFIX`, лимиты запросов и задержки входа. Без терминала вопросы не задаются: берутся значения по умолчанию или переменные окружения с теми же именами, например `APP_NAME=... DOMAIN=... sudo -E ./fakeapp.sh install`.
+
+Повторный `install` пересобирает и перезапускает контейнер. Значения в `.env` он не меняет, только дописывает новые ключи из `.env.example`. Существующие `login.html` и `favicon.ico` тоже не трогает.
+
+После установки скрипт печатает адрес upstream, например `http://127.0.0.1:8080`. Дальше подключите его к nginx.
 
 ## Команды
 
-```bash
-sudo ./vpn.sh install
-```
+| Команда | Действие |
+|---|---|
+| `sudo ./fakeapp.sh install` | установка или обновление (см. выше) |
+| `./fakeapp.sh start` / `stop` / `restart` | запуск, остановка, перезапуск контейнера |
+| `./fakeapp.sh status` | состояние контейнера и проверка `http://127.0.0.1:<порт>/` |
+| `./fakeapp.sh logs` | журнал контейнера |
+| `./fakeapp.sh snippet` | готовый блок `location /` для nginx с вашим портом |
+| `sudo ./fakeapp.sh remove [--purge] [-y]` | удалить контейнер и образ; с `--purge` также каталог данных. `.env`, проект и Docker остаются |
 
-Ставит Docker CE и rootless-расширения, настраивает rootless Docker и lingering для пользователя, вызвавшего `sudo`, создает `.env` (имя/описание сайта предлагаются случайные, DNS-имя сайта `DOMAIN` — необязательное, без протокола: приложение получает `https://<DOMAIN>` для `canonical`/`og:url`, а без имени эти теги не выводятся), готовит каталог данных и генерирует недостающие `login.html`/`favicon.ico`, собирает и запускает `fakeapp`, `nginx` и `certbot`. Если `DOMAIN` — DNS-имя, спрашивает `ACME_EMAIL` (необязательный e-mail аккаунта Let's Encrypt; пустой — аккаунт без e-mail; можно передать через окружение). Повторный запуск не меняет значения в `.env` (только дописывает новые ключи). Запуск от «голого» root без `sudo` отклоняется: rootless Docker под root невозможен.
+Для `start`, `stop`, `restart`, `status` и `logs` нужен доступ к Docker: root, `sudo` или группа `docker`.
 
-Сетевые шаги: понижает `net.ipv4.ip_unprivileged_port_start` до 80 (rootless Docker публикует 80/443); открывает 80/443 TCP в файрволе — `ufw`, если он активен, `firewalld`, если запущен, иначе правила iptables/ip6tables в INPUT, и только если INPUT не открыт полностью. Правила сохраняются через `netfilter-persistent`, если он установлен; иначе выводится предупреждение, что они не постоянные. Файрвол облачного провайдера открывайте отдельно. Всего шагов установки: 11.
+## Подключение к nginx
 
-```bash
-./vpn.sh webproxy user add|del|list|link <name>
-```
+### Принцип
 
-Пользователи Telegram WEB-proxy (см. «Telegram WEB-proxy»).
+1. Xray, панель 3X-UI и подписки остаются на своих секретных путях (или на fallback, см. варианты ниже).
+2. Всё остальное, начиная с корня `/`, nginx проксирует в fake-webapp.
+3. nginx **обязательно** перезаписывает `X-Real-IP` реальным адресом клиента. По нему приложение считает лимит запросов, а заголовку от клиента приложение верит. Поэтому порт приложения не должен быть доступен снаружи (`FAKEAPP_BIND=127.0.0.1`, по умолчанию).
 
-```bash
-./vpn.sh start
-```
-
-```bash
-./vpn.sh stop
-```
-
-```bash
-sudo ./vpn.sh remove
-```
-
-Удаляет контейнеры и собранные образы; том с сертификатами сохраняется. С `--purge` — также тома Docker, включая сертификаты (`tls-certs`), каталог данных, rootless Docker пользователя (со **всеми** его образами и контейнерами), lingering и файлы sysctl/AppArmor. Каталог проекта, `.env` и пакеты не удаляются. `-y` отвечает «да» на все вопросы.
-
-## Сеть
-
-Перед приложением стоит контейнер `nginx` на портах хоста 80 и 443 TCP. По умолчанию весь трафик идёт в `fakeapp`, nginx ставит `X-Real-IP` (по нему считается лимит запросов):
-
-- порт 80: `/.well-known/acme-challenge/` отдаётся из общего каталога certbot (неизвестные пути — в `fakeapp`); остальное — редирект на https, если задан `DOMAIN`, иначе проксируется в `fakeapp`;
-- порт 443: TLS, сертификат из тома `tls-certs`, пока его нет — самоподписанный. nginx проверяет сертификат каждые 60 с и перезагружается сам при изменении.
-
-`fakeapp` слушает порт `FAKEAPP_PORT` (по умолчанию 8080) внутри контейнера, публикуется на `FAKEAPP_BIND:FAKEAPP_PORT` хоста (по умолчанию `127.0.0.1:8080`), и nginx проксирует на `fakeapp:FAKEAPP_PORT` — порт задаётся одной переменной в `.env` (кроме 80 и 443, их занимает nginx); для прямой публикации задайте `FAKEAPP_BIND=0.0.0.0`. Файрвол: `install` открывает 80/443 TCP (см. «Команды»).
-
-## TLS-сертификаты
-
-Если `DOMAIN` — DNS-имя, `certbot` получает сертификат Let's Encrypt по HTTP-01 (через порт 80) и продлевает его: проверка раз в 12 ч, после ошибки повтор через 15 мин. Если `DOMAIN` пустой или это IP-адрес, сертификат не запрашивается, nginx использует самоподписанный.
-
-- `ACME_EMAIL` — необязательный e-mail аккаунта;
-- `ACME_STAGING=1` — тестовый сервер Let's Encrypt (сертификат браузеры не доверяют, лимиты выше); возврат к `0` заменит тестовый сертификат на боевой при следующем старте;
-- `TLS_CERTS_VOLUME` — имя тома (по умолчанию `tls-certs`).
-
-Сертификаты лежат в томе в виде `/etc/letsencrypt`: `live/<DOMAIN>/fullchain.pem`, `live/<DOMAIN>/privkey.pem`. Другой проект может использовать их, подключив том как внешний:
-
-```yaml
-services:
-  xray:
-    volumes:
-      - tls-certs:/etc/letsencrypt:ro
-volumes:
-  tls-certs:
-    external: true
-```
-
-Если задан `TLS_CERTS_VOLUME`, в примере используйте это имя.
-
-## Telegram WEB-proxy
-
-Необязательный прокси Telegram (WEB-транспорт) на [Telemt](https://github.com/telemt/telemt), образ `ghcr.io/telemt/telemt:3.5.17`. Работает в Telegram Desktop 7.1.3+ и в Android-клиенте (бета); стабильного клиента для iOS нет. Звонки через прокси не работают.
-
-Прокси отвечает по HTTPS на поддомене `<WEBPROXY_SUBDOMAIN>.<DOMAIN>` через nginx, порт 443. Отдельный порт MTProxy не открывается.
-
-Включение: `DOMAIN` должен быть DNS-именем. `sudo ./vpn.sh install` спрашивает метку поддомена (пусто — функция выключена) и публичный IPv4 этого хоста. Создайте A-запись `<метка>.<DOMAIN>` на этот адрес. Для поддомена выдаётся отдельный сертификат Let's Encrypt.
-
-Поведение:
-
-- весь поддомен уходит в Telemt;
-- любой некорректный запрос (неверный secret, неизвестный путь, порт 80) получает редирект 302 на `https://<DOMAIN>` с тем же путём;
-- журнал доступа на поддомене выключен: параметр `?bridge=` в запросе является учётными данными;
-- постквантовая группа X25519MLKEM768 в TLS по умолчанию включена (`TLS_PQ=1`). Если Android-клиент WEB-proxy не подключается (telegramdesktop/tproxy-server#16), поставьте `TLS_PQ=0`: останутся только классические группы. Настройка действует на все имена порта 443 сразу, nginx не умеет задавать её для отдельного имени.
-
-Пользователи (до 32):
+Сначала сохраните блок `location /` в отдельный файл:
 
 ```bash
-./vpn.sh webproxy user add <name>
-./vpn.sh webproxy user del <name>
-./vpn.sh webproxy user list
-./vpn.sh webproxy user link <name>
+sudo ./fakeapp.sh snippet | sudo tee /etc/nginx/snippets/fake-webapp.conf
 ```
 
-По умолчанию (`WEBPROXY_RELOAD=hot`) Telemt сам перечитывает конфиг: новый пользователь работает сразу, сессии удалённого закрываются, остальные клиенты не отключаются. `WEBPROXY_RELOAD=recreate` вместо этого пересоздаёт контейнер, и переподключаются все.
+Получится примерно такое (порт берётся из `.env`):
 
-Ссылка имеет вид `tg://webproxy?server=<поддомен>&secret=dd<32 hex>`. Последнего пользователя удалить нельзя. Чтобы выключить функцию, очистите `WEBPROXY_SUBDOMAIN` в `.env` и снова запустите `sudo ./vpn.sh install`.
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 60s;
+}
+```
 
-Данные: список пользователей и сгенерированный `telemt/config.toml` лежат в `data/webproxy` (каталог 0700, файлы 0600).
+Потом подключите его строкой `include snippets/fake-webapp.conf;` в нужный `server { }`. Выберите вариант по тому, кто у вас принимает порт 443.
 
-## Настройки
+> В `server { }` может уже быть свой `location /`, например `root /var/www/html` из стандартного конфига. Удалите его: два `location /` в одном сервере nginx не примет. Префиксные `location` с более длинными путями (пути Xray и панели) имеют приоритет над `/`, порядок строк не важен. Исключение: regex-локации (`location ~ ...`) проверяются раньше префиксных.
 
-См. комментарии в `.env.example` и таблицу переменных в `fake-webapp/README.md`. После правки `login.html` перезапустите контейнер: `./vpn.sh stop && ./vpn.sh start`.
+### Вариант A: TLS на 443 принимает nginx (Xray за ним на WebSocket или gRPC)
+
+Inbound'ы Xray слушают `127.0.0.1` без TLS, nginx раздаёт их по секретным путям. Всё остальное получает fake-webapp.
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com;
+
+    # Продление сертификата certbot (webroot); если используете другой способ, уберите.
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    # nginx >= 1.25.1: "listen 443 ssl;" и отдельной строкой "http2 on;"
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    # Xray: VLESS/VMess/Trojan + WebSocket, inbound на 127.0.0.1:10000, path /ws-a1b2c3
+    location /ws-a1b2c3 {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 1h;
+    }
+
+    # Xray: gRPC, inbound на 127.0.0.1:10001, serviceName grpc-d4e5f6
+    location /grpc-d4e5f6/ {
+        grpc_pass grpc://127.0.0.1:10001;
+        grpc_read_timeout 1h;
+        grpc_send_timeout 1h;
+    }
+
+    # Панель 3X-UI: в настройках панели IP 127.0.0.1, порт 2053, URI path /panel-x7y8z9/
+    location /panel-x7y8z9/ {
+        proxy_pass http://127.0.0.1:2053;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Всё остальное: сайт-обманка
+    include snippets/fake-webapp.conf;
+}
+```
+
+Если в вашем конфиге уже есть `location` для Xray, панели или подписок, оставьте их как есть и замените только `location /`.
+
+### Вариант B: на 443 Xray VLESS + TCP + TLS с fallback'ами
+
+Xray сам принимает TLS. Соединения без ключа VLESS он отправляет на fallback. Пусть fallback ведёт в nginx на `127.0.0.1` с PROXY protocol: так nginx узнает реальный IP клиента.
+
+В 3X-UI: inbound VLESS → транспорт TCP (RAW) → Security TLS. В TLS укажите ALPN `h2,http/1.1`. В разделе Fallbacks добавьте две записи:
+
+| SNI | ALPN | Path | Dest | xVer |
+|---|---|---|---|---|
+| | | | `8001` | `1` |
+| | `h2` | | `8002` | `1` |
+
+В JSON Xray это выглядит так:
+
+```json
+"fallbacks": [
+  { "dest": 8001, "xver": 1 },
+  { "alpn": "h2", "dest": 8002, "xver": 1 }
+]
+```
+
+nginx (например, `/etc/nginx/conf.d/fake-webapp.conf`):
+
+```nginx
+server {
+    listen 127.0.0.1:8001 proxy_protocol;
+    # nginx >= 1.25.1: вынесите 8002 в отдельный server с "http2 on;"
+    listen 127.0.0.1:8002 http2 proxy_protocol;
+    server_name _;
+
+    # Адрес клиента берётся из PROXY protocol, который присылает Xray.
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    include snippets/fake-webapp.conf;
+}
+```
+
+### Вариант C: на 443 Xray VLESS + REALITY, «маскировка под себя»
+
+REALITY пересылает чужие соединения на target. Вместо чужого сайта target может быть ваш nginx на `127.0.0.1` с настоящим сертификатом вашего домена. Тогда зонд, пришедший на 443 с вашим SNI, увидит fake-webapp с валидным сертификатом.
+
+В 3X-UI: inbound VLESS → TCP (RAW) → Security Reality:
+
+- **Target (Dest):** `127.0.0.1:8443`;
+- **Xver:** `1`;
+- **SNI (serverNames):** `example.com` (ваш домен; его A-запись должна указывать на этот сервер).
+
+Сертификат для `example.com` получите заранее, например `certbot certonly --webroot` через сервер на порту 80 из варианта A.
+
+```nginx
+server {
+    # REALITY требует от target TLS 1.3 и h2.
+    listen 127.0.0.1:8443 ssl http2 proxy_protocol;   # nginx >= 1.25.1: без http2 здесь + "http2 on;"
+    server_name example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols TLSv1.3;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    include snippets/fake-webapp.conf;
+}
+```
+
+Если nginx уже делит порт 443 по SNI через `stream { ... ssl_preread ... }`, направьте имя сайта-обманки на `server` из варианта A (или C), а в нём замените `location /` на `include snippets/fake-webapp.conf;`. Если stream передаёт соединения с `proxy_protocol on`, добавьте `set_real_ip_from` и `real_ip_header` как в вариантах B и C.
+
+### Применение и проверка
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+```bash
+curl -sI https://example.com/ | head -n1
+```
+
+Ожидается `HTTP/2 200` (или `HTTP/1.1 200`). Любой несуществующий путь отвечает редиректом 302 на `/`. Пути Xray и панели должны работать как раньше. Если клиенты VPN перестали подключаться, проверьте, что их `location` или fallback не перекрыты.
+
+Ваш реальный IP должен появиться в журнале контейнера (`./fakeapp.sh logs`). Если там у всех адрес `127.0.0.1`, значит nginx не передаёт `X-Real-IP` или (в вариантах B и C) не настроен `real_ip_header proxy_protocol`.
+
+### nginx в Docker-контейнере
+
+Для nginx внутри контейнера `127.0.0.1` означает сам контейнер. Возможны два решения:
+
+- запустить nginx с `network_mode: host`;
+- опубликовать приложение на адресе моста Docker: в `.env` задать `FAKEAPP_BIND=172.17.0.1` (адрес `docker0`), выполнить `sudo ./fakeapp.sh install` и проксировать на `http://172.17.0.1:<порт>`. Порт не должен быть открыт в интернет: проверьте файрвол.
+
+## Каталог данных
+
+`./data/fakeapp` (или `FAKEAPP_DATA_DIR`) монтируется в контейнер **только для чтения**: приложение ничего не пишет.
+
+| Файл | Откуда | Когда приложение видит изменения |
+|---|---|---|
+| `login.html` | `gen/login.py` (шаблон Go `html/template`). Обязателен: без него или с битым шаблоном приложение не стартует | после `./fakeapp.sh restart` |
+| `favicon.ico` | `gen/favicon.py` (первая буква `APP_NAME`, оформление из `PAGE_SEED`) | сразу |
+| любые другие файлы и подкаталоги | кладёте сами; отдаются по пути `/<путь>` | сразу |
+
+Не отдаются:
+
+- скрытые файлы и каталоги (`.*`);
+- сам `/login.html`;
+- каталоги (листинга нет).
+
+Отсутствующий путь даёт редирект на `/`.
+
+Права: контейнер работает от непривилегированного uid, поэтому нужны права `r` на файлах и `r-x` на каталогах (обычные 644 и 755). `install` выставляет их сам (`chmod -R a+rX`).
+
+Новый вариант оформления:
+
+1. Смените `PAGE_SEED` в `.env`.
+2. Удалите `login.html` и `favicon.ico`.
+3. Снова выполните `sudo ./fakeapp.sh install`.
+
+## Удаление
+
+```bash
+sudo ./fakeapp.sh remove --purge
+```
+
+Удаляет контейнер, образ и каталог данных. Docker, `.env` и каталог проекта остаются. Удалите `include snippets/fake-webapp.conf;` (и fallback или target в Xray, если меняли) и перезагрузите nginx.
