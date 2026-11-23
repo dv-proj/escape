@@ -47,7 +47,7 @@ services:
       - "${FAKEAPP_PORT:-8080}"
     volumes:
       # login.html (page template, required) and favicon.ico, created by
-      # gen/login.py and gen/favicon.py (`fakeapp.sh install` runs them), plus any
+      # gen/login.py and gen/favicon.py (`install.sh install` runs them), plus any
       # other files to serve as is (subdirectories allowed, hidden files not).
       # Read-only: the app never writes. Files need to be readable by "others"
       # (the container runs as a non-root uid): directories 755, files 644.

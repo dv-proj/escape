@@ -1,5 +1,7 @@
 # escape: сайт-обманка fake-webapp за nginx в Docker
 
+[English](README.en.md) | Русский
+
 Инструмент разворачивает на сервере Docker-стек: контейнер `nginx` принимает HTTPS на 443 и отдаёт сайт-обманку `fakeapp`. Это правдоподобная страница входа в веб-сервис (Go, исходники в `fake-webapp/`). Её видят обычные посетители и активные зонды, которые заходят на ваш домен без ключа VPN.
 
 nginx публикует порты 80 и 443 хоста, получает сертификат Let's Encrypt для вашего домена (certbot, метод webroot) и сам продлевает его. `fakeapp` наружу не публикуется: он доступен только внутри сети compose как `http://fakeapp:<порт>`. Дополнительные сервисы (расширения) подключаются к этому стеку отдельными файлами и добавляют свои `location` в nginx (см. [«Расширения»](#расширения)). Скрипт **не трогает** Xray, 3X-UI и файрвол.
@@ -8,14 +10,27 @@ nginx публикует порты 80 и 443 хоста, получает се�
 
 | Файл | Назначение |
 |---|---|
-| `fakeapp.sh` | установка и управление |
-| `extensions.d/` | расширения установки (по файлу на расширение); `extensions.d/telegram-web-proxy/`: скрипты расширения Telegram web proxy |
+| `install.sh` | единственная точка входа: установка и управление (`./install.sh <команда>`). Файл небольшой: скачивание проекта при запуске через `curl | bash` и подключение модулей из `lib/` в фиксированном порядке |
+| `lib/i18n.sh` | язык сообщений: функция `t КЛЮЧ`, выбор языка (`--lang`, `FAKEAPP_LANG`), загрузка текстов расширений (`ext_load_lang`) |
+| `lib/lang/en.sh`, `lib/lang/ru.sh` | тексты сообщений на английском и русском (одинаковый набор ключей) |
+| `lib/common.sh` | вывод, `die`/`step`/`on_err`, фазы и список проблем (`phase`, `problem`), `confirm`, обёртка `docker compose`, общие пути |
+| `lib/gen.sh` | случайные значения и вид сайта-обманки (название, описание, ключевые слова) |
+| `lib/env.sh` | `.env`: проверки значений, вопросы, генерация из `.env.example`, дополнение существующего `.env`, чтение значений |
+| `lib/system.sh` | проверка ОС и утилит, установка пакетов, обнаружение и установка Docker |
+| `lib/nginx.sh` | сборка конфигурации nginx из шаблона, каталог `data/nginx`, проверка портов 80/443 |
+| `lib/certs.sh` | сертификаты: временный самоподписанный, Let's Encrypt (certbot), таймер продления, проверка DNS |
+| `lib/app.sh` | проект: проверка файлов, каталог данных, проверка ответа сайта, итоговая сводка |
+| `lib/extensions.sh` | каркас расширений и функции `ext_*` для файлов из `extensions.d/` |
+| `lib/commands.sh` | команды `install`, `start`, `stop` и остальные, справка, `main` |
+| `extensions.d/` | расширения установки (по файлу на расширение) и их описание ([extensions.d/README.md](extensions.d/README.md)); `extensions.d/telegram-web-proxy/`: скрипты расширения Telegram web proxy, `extensions.d/<id>/lang/`: тексты расширения на двух языках |
+| `tests/check-i18n.sh` | проверка файлов сообщений: одинаковые наборы ключей `en`/`ru`, все ключи из кода есть в английском файле |
 | `nginx/` | `docker-compose.yml` (сервисы `nginx` и одноразовый `certbot`) и шаблон конфигурации `default.conf.template` |
 | `fake-webapp/` | исходники приложения, `Dockerfile`, описание (`fake-webapp/README.md`) |
 | `fake-webapp/gen/` | генераторы `login.py` и `favicon.py` (Python 3, только stdlib); запускаются на хосте, в образ не входят |
 | `fake-webapp/docker-compose.yml` | сервис `fakeapp` |
 | `docker-compose.yml` | основной файл (проект `fakeapp`): `include` для `nginx/docker-compose.yml`, `fake-webapp/docker-compose.yml` и `data/extensions.compose.yml`; про расширения в нём ничего нет |
 | `.env.example` | шаблон настроек; при установке копируется в `.env` |
+| `README.md`, `README.en.md` | это описание на русском и на английском |
 | `data/` (не в git) | `fakeapp/` (страница и файлы сайта), `nginx/` (сгенерированный конфиг, `locations.d/`, webroot), `letsencrypt/` (сертификаты), `extensions.compose.yml` (генерируется), `telegram-web-proxy/` (расширение: конфиг и состояние) |
 
 ## Требования
@@ -28,17 +43,28 @@ nginx публикует порты 80 и 443 хоста, получает се�
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/fakeapp.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/install.sh | sudo bash -s -- install
 ```
 
-Скрипт сам клонирует проект в `/opt/fakeapp` (переменные `FAKEAPP_DIR`, `FAKEAPP_REPO`, `FAKEAPP_BRANCH`) и продолжает установку оттуда; вопросы задаются в терминале. Дальнейшее управление: `cd /opt/fakeapp && ./fakeapp.sh <команда>`.
+Скрипт сам клонирует проект и продолжает установку оттуда; вопросы задаются в терминале. Куда и откуда клонировать, задают переменные окружения (значения по умолчанию в скобках): `FAKEAPP_DIR` (`/opt/fakeapp`), `FAKEAPP_REPO` (`https://github.com/dv-proj/escape.git`), `FAKEAPP_BRANCH` (ветка по умолчанию репозитория). Если каталог уже содержит клон, он обновляется (`git pull --ff-only`). Дальнейшее управление: `cd /opt/fakeapp && ./install.sh <команда>`. Свой язык и флаги передаются после `--`, например `... | sudo bash -s -- --lang ru install`.
 
-В конце установки показывается меню дополнительных функций (расширений). Без меню: `--with id1,id2` или `FAKEAPP_EXTENSIONS=all`; список: `./fakeapp.sh extensions`. Как добавить своё расширение: [extensions.d/README.md](extensions.d/README.md).
+### Язык сообщений
+
+Первый вопрос `install` (и `extensions --with`, если запустить их одни в терминале): `Language / Язык: 1 - English, 2 - Russian [1]`, по умолчанию английский. Выбор можно задать заранее: флагом `--lang en|ru` или переменной окружения `FAKEAPP_LANG`; тогда вопроса нет. Выбор сохраняется в `.env` (ключ `FAKEAPP_LANG`) и при следующих запусках применяется молча (включая `status`, `logs` и остальные команды); флаг и переменная окружения важнее значения из `.env` и при `install` обновляют его. Неизвестное значение (не `en` и не `ru`) попадает в список проблем фазы проверки. Без терминала и без указания языка используется английский. Команды, флаги, имена переменных, пути и вывод Docker, apt и certbot не переводятся.
+
+Установка идёт тремя фазами, одинаково для основной части и для каждого расширения:
+
+1. **Сбор.** Сначала выбор языка, затем все вопросы сразу: домен, e-mail для Let's Encrypt, название, описание и ключевые слова сайта, затем меню дополнительных функций (расширений) и вопросы самих расширений (например, исходящий интерфейс). Переменные окружения и флаги заменяют вопросы; без терминала вопросов нет. Ничего не устанавливается и не меняется.
+2. **Проверка.** Все значения проверяются вместе до любых изменений: имя домена, свободные порты 80/443, файлы проекта, исходящий интерфейс и другие проверки расширений. DNS домена проверяется предупреждением (указывает ли он на этот сервер). Все найденные проблемы выводятся списком сразу; если среди них есть серьёзные, установка прекращается до начала развёртывания.
+3. **Развёртывание.** Только теперь ставятся пакеты и Docker, пишутся `.env` и конфигурация, собирается и запускается стек, выпускается сертификат, применяются расширения. Вопросов здесь больше нет.
+
+Меню расширений показывается после вопросов основной части. Без меню: `--with id1,id2` (или `--with all`), либо переменная `FAKEAPP_EXTENSIONS` с тем же значением; отдельно от основной установки расширения ставит `./install.sh extensions --with id`. Список: `./install.sh extensions`. Как добавить своё расширение: [extensions.d/README.md](extensions.d/README.md).
 
 Скрипт задаёт только эти вопросы:
 
 | Вопрос | Ключ `.env` | По умолчанию |
 |---|---|---|
+| Язык: `Language / Язык: 1 - English, 2 - Russian [1]` | `FAKEAPP_LANG` | `en` |
 | DNS-имя сайта, например `app.example.com` (обязательно) | `DOMAIN` | нет: без него установка не идёт дальше |
 | E-mail для Let's Encrypt (необязательно) | `LE_EMAIL` | пусто: регистрация без e-mail |
 | Название сайта | `APP_NAME` | случайное правдоподобное |
@@ -47,27 +73,63 @@ curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/fakeapp.sh | su
 | Часовой пояс | `TZ` | часовой пояс хоста |
 
 - **`DOMAIN`** задаёт `server_name` nginx, домен сертификата и теги `canonical` и `og:url` (`https://<DOMAIN>`). Если в существующем `.env` его нет или он пуст, скрипт спросит при следующем запуске.
-- Порты nginx (`NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, по умолчанию 80 и 443), `LE_STAGING` (`1`: тестовый CA Let's Encrypt, сертификат не доверенный, без лимитов) и порт приложения внутри сети (`FAKEAPP_PORT`, 8080) не спрашиваются: при необходимости задайте их переменными окружения при первом запуске или правьте `.env`. Скрипт проверяет, что 80 и 443 свободны, и называет программу, которая их занимает.
+- Порты nginx (`NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, по умолчанию 80 и 443), `LE_STAGING` (`1`: тестовый CA Let's Encrypt, сертификат не доверенный, без лимитов) и порт приложения внутри сети (`FAKEAPP_PORT`, 8080) не спрашиваются: при необходимости задайте их переменными окружения при первом запуске или правьте `.env`. Скрипт проверяет, что порты nginx свободны, и называет программу, которая их занимает. Порт 80 нужен Let's Encrypt для проверки домена: при другом `NGINX_HTTP_PORT` пробросьте 80 на него.
 
-Остальные параметры генерируются случайно: `PAGE_SEED` (вариант оформления), `RANDOM_DATA_SUFFIX`, лимиты запросов и задержки входа. Без терминала вопросы не задаются: берутся значения по умолчанию или переменные окружения с теми же именами, например `DOMAIN=app.example.com LE_EMAIL=me@example.com sudo -E ./fakeapp.sh install`. Без `DOMAIN` установка без терминала завершится ошибкой.
+Остальные параметры генерируются случайно: `PAGE_SEED` (вариант оформления), `RANDOM_DATA_SUFFIX`, лимиты запросов (`RATE_LIMIT_RPS`, `RATE_LIMIT_BURST`, `RATE_LIMIT_GLOBAL_RPS`) и задержки входа (`LOGIN_DELAY_MIN_MS`, `LOGIN_DELAY_MAX_MS`). Без терминала вопросы не задаются: берутся значения по умолчанию или переменные окружения с теми же именами, например `DOMAIN=app.example.com LE_EMAIL=me@example.com sudo -E ./install.sh install`. Без `DOMAIN` установка без терминала завершится ошибкой.
 
-Что делает `install` после проверок: создаёт временный самоподписанный сертификат (чтобы nginx стартовал сразу), собирает и запускает стек, затем запрашивает настоящий сертификат одноразовым контейнером certbot и подставляет его в nginx. Если сертификат получить не удалось (DNS указывает не сюда, порт 80 недоступен из интернета, лимиты Let's Encrypt), скрипт печатает причину и подсказку, остальная установка не прерывается, nginx работает с самоподписанным сертификатом. Исправьте причину и выполните `sudo ./fakeapp.sh renew` (или повторите `install`). Сертификаты хранятся в `data/letsencrypt/`. Продление: systemd-таймер `fakeapp-certbot-renew.timer` (дважды в сутки запускает `./fakeapp.sh renew`: `certbot renew` и перезагрузка nginx); если systemd не запущен, ставится запись в `/etc/cron.d/fakeapp-certbot`.
+Что делает `install` после проверок: создаёт временный самоподписанный сертификат (чтобы nginx стартовал сразу), собирает и запускает стек, затем запрашивает настоящий сертификат одноразовым контейнером certbot и подставляет его в nginx. Если сертификат получить не удалось (DNS указывает не сюда, порт 80 недоступен из интернета, лимиты Let's Encrypt), скрипт печатает причину и подсказку, остальная установка не прерывается, nginx работает с самоподписанным сертификатом. Исправьте причину и выполните `sudo ./install.sh renew` (или повторите `install`). Сертификаты хранятся в `data/letsencrypt/`. Продление: systemd-таймер `fakeapp-certbot-renew.timer` (дважды в сутки запускает `./install.sh renew`: `certbot renew` и перезагрузка nginx); если systemd не запущен, ставится запись в `/etc/cron.d/fakeapp-certbot`.
 
-Повторный `install` пересобирает и перезапускает стек. Значения в `.env` он не меняет, только дописывает новые ключи из `.env.example`. Существующие `login.html` и `favicon.ico` тоже не трогает.
+Повторный `install` пересобирает и перезапускает стек и вопросов не задаёт (кроме языка, если он ещё не выбран). Значения в `.env` он не меняет, только дописывает новые ключи из `.env.example` (и записывает выбранный язык). Существующие `login.html` и `favicon.ico` тоже не трогает.
 
 ## Команды
 
+Общий вид: `./install.sh [флаги] <команда>`. Без команды выводится справка (код возврата 2).
+
 | Команда | Действие |
 |---|---|
-| `sudo ./fakeapp.sh install` | установка или обновление (см. выше) |
-| `./fakeapp.sh start` / `stop` / `restart` | запуск, остановка, перезапуск стека (`start` и `restart` заново генерируют конфигурацию nginx) |
-| `./fakeapp.sh status` | состояние контейнеров, сертификат, таймер продления и проверка `https://<DOMAIN>/` на этом сервере (`curl --resolve` на `127.0.0.1`) |
-| `./fakeapp.sh logs` | журналы контейнеров |
-| `sudo ./fakeapp.sh renew` | продлить сертификаты и перечитать конфигурацию nginx; если сертификата ещё нет, запросить его |
-| `./fakeapp.sh extensions` | список расширений |
-| `sudo ./fakeapp.sh remove [--purge] [-y]` | удалить контейнеры, образы и таймер продления; с `--purge` также `data/fakeapp`, `data/nginx` и `data/letsencrypt` (включая сертификаты). `.env`, проект и Docker остаются |
+| `sudo ./install.sh install` | установка или обновление (см. выше) |
+| `./install.sh start` / `stop` / `restart` | запуск, остановка, перезапуск стека (`start` и `restart` заново генерируют конфигурацию nginx) |
+| `./install.sh status` | состояние контейнеров, сертификат, таймер продления и проверка `https://<DOMAIN>/` на этом сервере (`curl --resolve` на `127.0.0.1`) |
+| `./install.sh logs` | журналы контейнеров (выход: Ctrl+C) |
+| `sudo ./install.sh renew` | продлить сертификаты и перечитать конфигурацию nginx; если сертификата ещё нет, запросить его |
+| `./install.sh extensions` | список расширений; с `--with id,...` (root) ставит их, как при `install` |
+| `sudo ./install.sh remove [--purge] [-y]` | удалить контейнеры, образы и таймер продления; с `--purge` также `data/fakeapp`, `data/nginx` и `data/letsencrypt` (включая сертификаты). `.env`, проект и Docker остаются |
 
-Для `start`, `stop`, `restart`, `status` и `logs` нужен доступ к Docker: root, `sudo` или группа `docker`. Команды `snippet` больше нет: блок для своего nginx не нужен.
+Для `start`, `stop`, `restart`, `status` и `logs` нужен доступ к Docker: root, `sudo` или группа `docker`. Справка: `./install.sh --help` (или `-h`, `help`); на выбранном языке: `./install.sh --lang ru --help`.
+
+### Флаги
+
+| Флаг | Действие |
+|---|---|
+| `-y`, `--yes` | отвечать «да» на все подтверждения (для `remove`, нестандартной ОС и т. п.); также отключает меню расширений |
+| `--with IDS` | расширения без меню: список через запятую или `all`; для `install` и `extensions` (также переменная `FAKEAPP_EXTENSIONS`) |
+| `--lang en\|ru` | язык сообщений (также переменная `FAKEAPP_LANG`) |
+| `--purge` | только для `remove`: удалить и каталоги данных |
+| `-h`, `--help` | справка |
+
+### Переменные окружения
+
+Используются при создании `.env` (вместо вопросов; передавайте через `sudo -E` или `sudo VAR=...`): `DOMAIN`, `LE_EMAIL`, `LE_STAGING`, `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, `FAKEAPP_PORT`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`. Незаданные `APP_*` генерируются случайно. `TZ` из окружения не читается: берётся часовой пояс хоста (или значение, введённое в ответ на вопрос). Остальные: `FAKEAPP_LANG` (язык), `FAKEAPP_EXTENSIONS` (расширения без меню), `FAKEAPP_DIR`, `FAKEAPP_REPO`, `FAKEAPP_BRANCH` (запуск через `curl | bash`), `NO_COLOR` (отключить цвет). Переменные расширений описаны в их разделах (`TGPROXY_*`).
+
+### Ключи `.env`
+
+Файл создаётся из `.env.example` (режим 600). Повторный `install` дописывает в него недостающие ключи, остальное не трогает; значения можно менять вручную и применять командой `./install.sh restart`.
+
+| Ключ | Смысл |
+|---|---|
+| `FAKEAPP_LANG` | язык сообщений, `en` или `ru` |
+| `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS` | название, описание и ключевые слова сайта-обманки |
+| `DOMAIN` | DNS-имя сайта (обязательно) |
+| `RANDOM_DATA_SUFFIX` | суффикс пути со случайными данными `/random-<суффикс>?size=N` |
+| `PAGE_SEED` | зерно оформления сайта-обманки |
+| `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST`, `RATE_LIMIT_GLOBAL_RPS` | лимиты запросов (на клиента, всплеск, общий) |
+| `LOGIN_DELAY_MIN_MS`, `LOGIN_DELAY_MAX_MS` | задержка ответа на `POST /login` |
+| `TZ` | часовой пояс контейнера |
+| `FAKEAPP_PORT` | порт приложения внутри сети compose (8080) |
+| `FAKEAPP_DATA_DIR` | необязательно: другой каталог данных (по умолчанию `data/fakeapp`) |
+| `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT` | порты nginx на хосте (80 и 443) |
+| `LE_EMAIL` | e-mail для Let's Encrypt (необязательно) |
+| `LE_STAGING` | `1`: тестовый CA Let's Encrypt; после перехода с `1` на `0` удалите `data/letsencrypt` и выполните `install` |
 
 ## nginx в контейнере
 
@@ -82,15 +144,17 @@ curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/fakeapp.sh | su
 Проверка:
 
 ```bash
-./fakeapp.sh status
+./install.sh status
 curl -sI https://<DOMAIN>/ | head -n1
 ```
 
-Ожидается `HTTP/2 200`. Любой несуществующий путь отвечает редиректом 302 на `/`. Ваш реальный IP должен появиться в журнале приложения (`./fakeapp.sh logs`); если там у всех адрес `172.x.x.x`, значит nginx не передаёт `X-Real-IP`.
+Ожидается `HTTP/2 200`. Любой несуществующий путь отвечает редиректом 302 на `/`. Ваш реальный IP должен появиться в журнале приложения (`./install.sh logs`); если там у всех адрес `172.x.x.x`, значит nginx не передаёт `X-Real-IP`.
 
 ## Расширения
 
 Дополнительные функции ставятся из `extensions.d/` и не правят общие файлы стека: расширение добавляет свой compose-файл в `data/extensions.compose.yml` (`ext_register_compose`) и свой `location` в `data/nginx/locations.d/<id>.conf` (`ext_nginx_location_put`). Подробности, сигнатуры функций и пример: [extensions.d/README.md](extensions.d/README.md).
+
+Расширение регистрируется вызовом `register_extension ID "Название" ФУНКЦИЯ` и участвует в трёх фазах установки через необязательные хуки: `ext_<id>_collect` (все вопросы, ничего не меняет), `ext_<id>_validate` (проверки только на чтение, проблемы через `problem`) и функция развёртывания (без вопросов); в имени хука `-` из `<id>` заменяется на `_`. Функции-помощники: `ext_register_compose`, `ext_unregister_compose`, `ext_nginx_location_put`, `ext_nginx_location_rm`, `ext_domain`, `env_value`, `problem`, `ext_compose`, а для сообщений `t` и `ext_load_lang`. Тексты расширения хранятся в `extensions.d/<id>/lang/en.sh` и `ru.sh`.
 
 ### Telegram web proxy (`telegram-web-proxy`)
 
@@ -98,10 +162,10 @@ curl -sI https://<DOMAIN>/ | head -n1
 
 **Требования.** Стек установлен и запущен (`DOMAIN` берётся из `.env`, повторно не спрашивается); `NGINX_HTTPS_PORT=443` (Telegram Desktop принимает только 443); `iproute2`, `openssl`, `python3`, `iptables` или `nft` на хосте; доступ к `ghcr.io` при первой установке. Клиент: **Telegram Desktop 7.1 или новее** (тип прокси WEB). Мобильные клиенты не проверялись. Ресурсы: контейнер ограничен `128m` памяти (`TGPROXY_MEM_LIMIT`), в простое занимает десятки МБ; для сервера 1 CPU и 1 ГБ запас большой.
 
-**Установка.** Пункт меню «Telegram web proxy» в конце `install`, либо без меню:
+**Установка.** Пункт меню «Telegram web proxy» (после вопросов основной части) в конце `install`, либо без меню:
 
 ```bash
-TGPROXY_OUTWAY=eth0 sudo -E ./fakeapp.sh extensions --with telegram-web-proxy
+TGPROXY_OUTWAY=eth0 sudo -E ./install.sh extensions --with telegram-web-proxy
 ```
 
 Установка генерирует случайный секретный путь (20 символов) и секрет пользователя (32 hex), пишет `data/telegram-web-proxy/config.toml` (режим 600, владелец uid контейнера) и `state.env` (режим 600), подключает compose-файл (`ext_register_compose`) и `location` (`ext_nginx_location_put`), настраивает outway, сохраняет образ командой `docker save` в `data/telegram-web-proxy/telemt-image.tar` (`TGPROXY_SAVE_IMAGE=0` отключает) и в конце печатает ссылку `tg://webproxy?...`, интерфейс outway и предупреждения. Ссылку берёт из журнала TELEMT (он печатает её при старте); если в журнале её уже нет, вычисляет по документированному формату.
@@ -130,7 +194,7 @@ TGPROXY_OUTWAY=eth0 sudo -E ./fakeapp.sh extensions --with telegram-web-proxy
 
 **Fail-closed.** Если интерфейс outway не существует или выключен, в таблице остаётся только `unreachable`, а `DROP` не пускает трафик подсети ни через какой другой интерфейс: к Telegram контейнер не достучится, но в обход outway ничего не утечёт; `tgproxy-outway.sh status` пишет `BLOCKED (fail-closed)`. Правила переживают перезагрузку: systemd-юнит `telegram-web-proxy-outway.service` (oneshot, `RemainAfterExit`, после `docker.service`; при остановке переходит в режим «блокировать») плюс таймер `telegram-web-proxy-outway.timer`, который каждые 30 секунд восстанавливает маршрут после перезапуска VPN. Нюанс: сразу после загрузки хоста контейнер может стартовать на несколько секунд раньше юнита; в этом режиме TELEMT не открывает исходящих соединений, пока нет клиентов. Если ответы по outway теряются, проверьте строгий `rp_filter` (`net.ipv4.conf.all.rp_filter=2`): скрипт предупреждает об этом.
 
-**Скрипты на хосте.** Установка копирует три самодостаточных скрипта (им не нужны `fakeapp.sh`, репозиторий и сеть; кроме `docker pull` образа) в `/opt/fakeapp-tgproxy/`, а если установку запустили через `sudo` обычного пользователя, то в `~пользователь/telegram-web-proxy/` (владелец root, права 755; каталог меняется через `TGPROXY_SCRIPTS_DIR`). Скрипты читают `data/telegram-web-proxy/state.env`:
+**Скрипты на хосте.** Установка копирует три самодостаточных скрипта (им не нужны `install.sh`, репозиторий и сеть; кроме `docker pull` образа) в `/opt/fakeapp-tgproxy/`, а если установку запустили через `sudo` обычного пользователя, то в `~пользователь/telegram-web-proxy/` (владелец root, права 755; каталог меняется через `TGPROXY_SCRIPTS_DIR`). Скрипты читают `data/telegram-web-proxy/state.env`:
 
 - `tgproxy-config.sh`: `link`, `status`, `outway [интерфейс]`, `rotate path|secret|all`, `render`, `apply` (заново собрать конфиг, подгрузить образ, применить outway и `location`, запустить контейнер), `restart`, `pull` (`docker pull`, а при недоступности реестра `docker load` из сохранённого tar);
 - `tgproxy-outway.sh`: `up`, `block`, `down`, `status`, `list`, `check`, `install-unit`, `remove-unit`; `TGPROXY_DRY_RUN=1` печатает команды;
@@ -141,8 +205,8 @@ TGPROXY_OUTWAY=eth0 sudo -E ./fakeapp.sh extensions --with telegram-web-proxy
 - Секретный путь и секрет входят в учётные данные: ссылку нельзя публиковать. Смена пути или секрета делает старую ссылку недействительной. Секреты лежат только в `config.toml`, `state.env` (оба 600) и в ссылке, которую TELEMT печатает в свой журнал Docker (читается только root и группой `docker`).
 - nginx не пишет журнал доступа для этого `location` (в нём есть токены клиента) и передаёт TELEMT `X-Forwarded-For $remote_addr` (перезапись, не добавление); TELEMT доверяет заголовку только от подсети сети compose, и порт `18080` наружу не публикуется.
 - Контейнер: `read_only`, `cap_drop: ALL`, `no-new-privileges`, лимиты памяти и процессов, без API управления, без нативного слушателя MTProxy. Любые обращения к другим путям отвечает обманка.
-- Адрес `fakeapp` TELEMT разрешает один раз при старте: после пересоздания только `fakeapp` перезапустите прокси (`tgproxy-config.sh restart`; `./fakeapp.sh restart` перезапускает всё сразу).
-- `./fakeapp.sh remove` убирает контейнер `telemt`, но не правила outway и юниты: сначала выполните `tgproxy-remove.sh --purge`.
+- Адрес `fakeapp` TELEMT разрешает один раз при старте: после пересоздания только `fakeapp` перезапустите прокси (`tgproxy-config.sh restart`; `./install.sh restart` перезапускает всё сразу).
+- `./install.sh remove` убирает контейнер `telemt`, но не правила outway и юниты: сначала выполните `tgproxy-remove.sh --purge`.
 
 ## Каталог данных
 
@@ -150,7 +214,7 @@ TGPROXY_OUTWAY=eth0 sudo -E ./fakeapp.sh extensions --with telegram-web-proxy
 
 | Файл | Откуда | Когда приложение видит изменения |
 |---|---|---|
-| `login.html` | `gen/login.py` (шаблон Go `html/template`). Обязателен: без него или с битым шаблоном приложение не стартует | после `./fakeapp.sh restart` |
+| `login.html` | `gen/login.py` (шаблон Go `html/template`). Обязателен: без него или с битым шаблоном приложение не стартует | после `./install.sh restart` |
 | `favicon.ico` | `gen/favicon.py` (первая буква `APP_NAME`, оформление из `PAGE_SEED`) | сразу |
 | любые другие файлы и подкаталоги | кладёте сами; отдаются по пути `/<путь>` | сразу |
 
@@ -168,12 +232,12 @@ TGPROXY_OUTWAY=eth0 sudo -E ./fakeapp.sh extensions --with telegram-web-proxy
 
 1. Смените `PAGE_SEED` в `.env`.
 2. Удалите `login.html` и `favicon.ico`.
-3. Снова выполните `sudo ./fakeapp.sh install`.
+3. Снова выполните `sudo ./install.sh install`.
 
 ## Удаление
 
 ```bash
-sudo ./fakeapp.sh remove --purge
+sudo ./install.sh remove --purge
 ```
 
 Удаляет контейнеры, образы, таймер продления (systemd или `/etc/cron.d/fakeapp-certbot`), а также каталоги данных `data/fakeapp`, `data/nginx` и `data/letsencrypt` (сертификаты тоже). Без `--purge` данные и сертификаты остаются. Docker, `.env` и каталог проекта остаются в любом случае. Если у Xray или 3X-UI были изменены порты ради этого стека, верните их вручную.
