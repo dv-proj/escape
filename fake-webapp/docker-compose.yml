@@ -7,8 +7,9 @@
 #
 # Relative paths below are resolved against this directory (fake-webapp/).
 # Variables are interpolated from the including project's environment/.env
-# (see ../.env.example). Plain HTTP/h2c on FAKEAPP_PORT (default 8080): put a
-# TLS proxy (your nginx) in front.
+# (see ../.env.example). Plain HTTP/h2c on FAKEAPP_PORT (default 8080), no host
+# port is published: it is reachable only on the compose network as
+# http://fakeapp:FAKEAPP_PORT (the nginx service of this stack proxies to it).
 
 services:
   fakeapp:
@@ -25,7 +26,7 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
-      # Same port inside the container and on the host (FAKEAPP_PORT).
+      # Listen port inside the container (FAKEAPP_PORT).
       LISTEN_ADDR: ":${FAKEAPP_PORT:-8080}"
       APP_NAME: ${APP_NAME:?APP_NAME is required}
       APP_DESCRIPTION: ${APP_DESCRIPTION:-}
@@ -40,12 +41,13 @@ services:
       RANDOM_DATA_SUFFIX: ${RANDOM_DATA_SUFFIX:?RANDOM_DATA_SUFFIX is required}
       PAGE_SEED: ${PAGE_SEED:?PAGE_SEED is required}
       TZ: ${TZ:-UTC}
-    ports:
-      # Loopback by default: the app expects a proxy that sets X-Real-IP.
-      - "${FAKEAPP_BIND:-127.0.0.1}:${FAKEAPP_PORT:-8080}:${FAKEAPP_PORT:-8080}/tcp"
+    # Internal network only: the app trusts X-Real-IP, so it must not be
+    # published on the host (the proxy in front of it overwrites that header).
+    expose:
+      - "${FAKEAPP_PORT:-8080}"
     volumes:
       # login.html (page template, required) and favicon.ico, created by
-      # gen/login.py and gen/favicon.py (`fakeapp.sh install` runs them), plus any
+      # gen/login.py and gen/favicon.py (`install.sh install` runs them), plus any
       # other files to serve as is (subdirectories allowed, hidden files not).
       # Read-only: the app never writes. Files need to be readable by "others"
       # (the container runs as a non-root uid): directories 755, files 644.
