@@ -208,6 +208,7 @@ The file is created from `.env.example` (mode 600). A repeated `install` appends
 | `FAKEAPP_PORT` | application port inside the compose network (8080) |
 | `FAKEAPP_DATA_DIR` | optional: another data directory (default `data/fakeapp`) |
 | `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT` | nginx ports on the host (80 and 443) |
+| `LOG_MAX_SIZE`, `LOG_MAX_FILE` | container log rotation (Docker json-file): up to `LOG_MAX_FILE` files of `LOG_MAX_SIZE` per container, default `5m` and `3` (15 MB at most). With access logs off this holds well over 3 days; Docker has no rotation by age, so size is the only limit. Applied after `restart` |
 | `LE_EMAIL` | e-mail for Let's Encrypt (optional) |
 | `LE_STAGING` | `1`: the Let's Encrypt test CA; after switching from `1` to `0` delete `data/letsencrypt` and run `install` |
 

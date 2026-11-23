@@ -453,16 +453,16 @@ ${ip6:+$ip6
     tmpfs:
       - /run/telemt:rw,mode=1777,size=8m
     healthcheck:
-      test: ["CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "liveness"]
+      test: ["CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "ready"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 60s
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "\${LOG_MAX_SIZE:-5m}"
+        max-file: "\${LOG_MAX_FILE:-3}"
 
 networks:
   tgproxy:

@@ -208,6 +208,7 @@ curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/install.sh | su
 | `FAKEAPP_PORT` | порт приложения внутри сети compose (8080) |
 | `FAKEAPP_DATA_DIR` | необязательно: другой каталог данных (по умолчанию `data/fakeapp`) |
 | `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT` | порты nginx на хосте (80 и 443) |
+| `LOG_MAX_SIZE`, `LOG_MAX_FILE` | ротация логов контейнеров (Docker json-file): до `LOG_MAX_FILE` файлов по `LOG_MAX_SIZE` на контейнер, по умолчанию `5m` и `3` (до 15 МБ). При выключенном `access_log` этого хватает на заведомо больше 3 суток; ротации по возрасту у Docker нет, ограничение только по размеру. Применяется после `restart` |
 | `LE_EMAIL` | e-mail для Let's Encrypt (необязательно) |
 | `LE_STAGING` | `1`: тестовый CA Let's Encrypt; после перехода с `1` на `0` удалите `data/letsencrypt` и выполните `install` |
 
