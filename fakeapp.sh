@@ -12,6 +12,44 @@
 # your nginx yourself (see README.md, or `./fakeapp.sh snippet`).
 set -Eeuo pipefail
 
+# --- bootstrap (curl | bash) --------------------------------------------------------
+# `curl -fsSL <raw-url>/fakeapp.sh | sudo bash -s -- install` runs this file
+# without the rest of the project: clone it to FAKEAPP_DIR and continue from
+# there. Skipped when the project files sit next to the script.
+FAKEAPP_REPO="${FAKEAPP_REPO:-https://github.com/dv-proj/escape.git}"
+FAKEAPP_DIR="${FAKEAPP_DIR:-/opt/fakeapp}"
+FAKEAPP_BRANCH="${FAKEAPP_BRANCH:-}"
+
+bootstrap_project() {
+    local src="${BASH_SOURCE[0]:-}" self_dir=""
+    [[ -f "$src" ]] && self_dir="$(cd "$(dirname "$src")" && pwd)"
+    if [[ -n "$self_dir" && -f "$self_dir/docker-compose.yml" && -f "$self_dir/.env.example" ]]; then
+        return 0
+    fi
+    [[ $EUID -eq 0 ]] || { echo "error: run as root: curl -fsSL <url> | sudo bash -s -- install" >&2; exit 1; }
+    echo "==> fetching the project into $FAKEAPP_DIR" >&2
+    if ! command -v git >/dev/null 2>&1; then
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >&2
+    fi
+    if [[ -d "$FAKEAPP_DIR/.git" ]]; then
+        git -C "$FAKEAPP_DIR" pull --ff-only >&2
+    else
+        [[ ! -e "$FAKEAPP_DIR" || -z "$(ls -A "$FAKEAPP_DIR" 2>/dev/null)" ]] \
+            || { echo "error: $FAKEAPP_DIR exists and is not a fakeapp checkout" >&2; exit 1; }
+        git clone ${FAKEAPP_BRANCH:+--branch "$FAKEAPP_BRANCH"} "$FAKEAPP_REPO" "$FAKEAPP_DIR" >&2
+    fi
+    # No command given: the one-liner means "install".
+    (($#)) || set -- install
+    # stdin is the pipe with this script; give prompts the terminal if there is one.
+    if [[ ! -t 0 && -r /dev/tty ]] && (: </dev/tty) 2>/dev/null; then
+        exec "$FAKEAPP_DIR/fakeapp.sh" "$@" </dev/tty
+    fi
+    exec "$FAKEAPP_DIR/fakeapp.sh" "$@"
+}
+if [[ -z "${FAKEAPP_SH_LIB:-}" ]]; then
+    bootstrap_project "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR"
 
@@ -19,6 +57,7 @@ PREREQ_PKGS=(curl ca-certificates iproute2 python3)
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
 
 ASSUME_YES=0
+WITH_EXT=""
 PURGE=0
 CURRENT_STEP="startup"
 STEP_NO=0
@@ -80,6 +119,7 @@ Commands:
   restart   Restart the container (e.g. after editing login.html).
   status    Show the container state and check http://127.0.0.1:PORT/.
   logs      Follow the container log (Ctrl+C to quit).
+  extensions  List additional features (extensions.d/); with --with ID,... install them.
   snippet   Print an nginx location block that proxies to the app.
   remove    Remove the container and its image (root/sudo). With --purge
             also delete the data directory (login.html, favicon.ico and
@@ -87,6 +127,8 @@ Commands:
 
 Options:
   -y, --yes   Assume "yes" for every confirmation.
+  --with IDS  Extensions to install without the menu (comma list or "all");
+              also FAKEAPP_EXTENSIONS. Used by install and extensions.
   --purge     With `remove`: also delete the data directory.
   -h, --help  Show this help.
 
@@ -888,6 +930,75 @@ print_summary() {
     printf '  ./fakeapp.sh snippet\n'
 }
 
+# --- extensions ---------------------------------------------------------------------------------------
+# Each extension is one file extensions.d/<NN>-<id>.sh (see extensions.d/README.md).
+# Files are only added, never edited here, so branches adding extensions do not
+# conflict on merge. A file calls: register_extension ID "Title" INSTALL_FN.
+
+EXT_IDS=()
+declare -A EXT_TITLE=() EXT_FN=()
+EXT_SELECTED=""
+
+register_extension() {
+    local id=$1
+    [[ "$id" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "extension: bad id '$id'"
+    EXT_IDS+=("$id")
+    EXT_TITLE[$id]=$2
+    EXT_FN[$id]=$3
+}
+
+load_extensions() {
+    local f
+    for f in "$APP_DIR"/extensions.d/*.sh; do
+        [[ -f "$f" ]] || continue
+        # shellcheck disable=SC1090
+        source "$f"
+    done
+}
+
+# select_extensions: fill EXT_SELECTED (space separated ids) from --with /
+# FAKEAPP_EXTENSIONS ("all" allowed) or an interactive menu.
+select_extensions() {
+    local want="${WITH_EXT:-${FAKEAPP_EXTENSIONS:-}}" id i ans
+    EXT_SELECTED=""
+    ((${#EXT_IDS[@]})) || return 0
+    if [[ -n "$want" ]]; then
+        want="${want//,/ }"
+        if [[ "$want" == all ]]; then
+            EXT_SELECTED="${EXT_IDS[*]}"
+            return 0
+        fi
+        for id in $want; do
+            [[ -n "${EXT_FN[$id]:-}" ]] || die "unknown extension '$id' (see: ./fakeapp.sh extensions)"
+        done
+        EXT_SELECTED="$want"
+        return 0
+    fi
+    [[ -t 0 && ! $ASSUME_YES -eq 1 ]] || return 0
+    printf '\nAdditional features:\n' >&2
+    for i in "${!EXT_IDS[@]}"; do
+        printf '  %d) %s\n' $((i + 1)) "${EXT_TITLE[${EXT_IDS[i]}]}" >&2
+    done
+    read -r -p "Install which? numbers separated by spaces, 'all' or empty for none: " ans || return 0
+    [[ -n "$ans" ]] || return 0
+    if [[ "${ans,,}" == all ]]; then
+        EXT_SELECTED="${EXT_IDS[*]}"
+        return 0
+    fi
+    for i in ${ans//,/ }; do
+        [[ "$i" =~ ^[0-9]+$ && -n "${EXT_IDS[i - 1]:-}" ]] || die "bad choice '$i'"
+        EXT_SELECTED+=" ${EXT_IDS[i - 1]}"
+    done
+}
+
+run_extensions() {
+    local id
+    for id in $EXT_SELECTED; do
+        step "Extension: ${EXT_TITLE[$id]}"
+        "${EXT_FN[$id]}"
+    done
+}
+
 # --- commands -----------------------------------------------------------------------------------------
 
 require_installed() {
@@ -896,7 +1007,10 @@ require_installed() {
 
 cmd_install() {
     require_root install
-    STEP_TOTAL=6
+    select_extensions
+    local ext_count
+    ext_count=$(wc -w <<<"$EXT_SELECTED")
+    STEP_TOTAL=$((6 + ext_count))
     check_system_tools
 
     step "Checking the project directory"
@@ -919,9 +1033,28 @@ cmd_install() {
     compose up -d --build --wait
     check_http || true
 
+    run_extensions
+
     CURRENT_STEP="summary"
     printf '\n%sInstall finished.%s\n' "$C_BOLD" "$C_RESET" >&2
     print_summary
+}
+
+cmd_extensions() {
+    local id
+    if ((!${#EXT_IDS[@]})); then
+        echo "no extensions installed (see extensions.d/README.md)"
+        return 0
+    fi
+    for id in "${EXT_IDS[@]}"; do
+        printf '%-20s %s\n' "$id" "${EXT_TITLE[$id]}"
+    done
+    if [[ -n "${WITH_EXT:-}" ]]; then
+        require_root "extensions --with"
+        select_extensions
+        STEP_TOTAL=$(wc -w <<<"$EXT_SELECTED")
+        run_extensions
+    fi
 }
 
 cmd_start() {
@@ -1014,7 +1147,13 @@ main() {
                 ;;
             -y | --yes) ASSUME_YES=1 ;;
             --purge) PURGE=1 ;;
-            install | start | stop | restart | status | logs | snippet | remove)
+            --with)
+                (($# > 1)) || die "--with needs a value"
+                WITH_EXT="$2"
+                shift
+                ;;
+            --with=*) WITH_EXT="${1#--with=}" ;;
+            install | start | stop | restart | status | logs | snippet | remove | extensions)
                 [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
                 cmd="$1"
                 ;;
@@ -1026,6 +1165,7 @@ main() {
         usage >&2
         exit 2
     }
+    load_extensions
     ((!PURGE)) || [[ "$cmd" == remove ]] || die "--purge only applies to 'remove'"
     trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
     "cmd_$cmd"

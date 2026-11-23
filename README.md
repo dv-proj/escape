@@ -9,6 +9,7 @@
 | Файл | Назначение |
 |---|---|
 | `fakeapp.sh` | установка и управление |
+| `extensions.d/` | расширения установки (по файлу на расширение) |
 | `fake-webapp/` | исходники приложения, `Dockerfile`, описание (`fake-webapp/README.md`) |
 | `fake-webapp/gen/` | генераторы `login.py` и `favicon.py` (Python 3, только stdlib); запускаются на хосте, в образ не входят |
 | `fake-webapp/docker-compose.yml` | сервис `fakeapp` |
@@ -25,12 +26,12 @@
 ## Установка
 
 ```bash
-git clone <url-репозитория> /opt/fakeapp
+curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/fakeapp.sh | sudo bash -s -- install
 ```
 
-```bash
-cd /opt/fakeapp && sudo ./fakeapp.sh install
-```
+Скрипт сам клонирует проект в `/opt/fakeapp` (переменные `FAKEAPP_DIR`, `FAKEAPP_REPO`, `FAKEAPP_BRANCH`) и продолжает установку оттуда; вопросы задаются в терминале. Дальнейшее управление: `cd /opt/fakeapp && ./fakeapp.sh <команда>`.
+
+В конце установки показывается меню дополнительных функций (расширений). Без меню: `--with id1,id2` или `FAKEAPP_EXTENSIONS=all`; список: `./fakeapp.sh extensions`. Как добавить своё расширение: [extensions.d/README.md](extensions.d/README.md).
 
 Скрипт задаёт только эти вопросы:
 
