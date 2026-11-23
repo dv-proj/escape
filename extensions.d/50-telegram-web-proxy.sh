@@ -1,20 +1,26 @@
   # Extension: Telegram WEB proxy on top of TELEMT (https://github.com/telemt/telemt).
 # shellcheck shell=bash
-# Telegram Desktop 7.1+ connects with a tg://webproxy link to https://DOMAIN/<secret path>/;
+# Telegram Desktop 7.1+ connects with a tg://webproxy link to https://<proxy name>/<secret path>/;
 # nginx forwards only that path to the telemt container, every other path stays on
-# the decoy site. The container's outgoing traffic leaves through a chosen host
+# the decoy site. The proxy name (TGPROXY_DOMAIN) is DOMAIN of the site by default; a
+# separate name gets its own nginx server blocks (ext_nginx_server_put) and its own
+# Let's Encrypt certificate (ext_cert_request), otherwise the secret path is a
+# location in the server of the site (ext_nginx_location_put). The container's outgoing traffic leaves through a chosen host
 # interface ("outway", policy routing). See README.md, section "Telegram web proxy".
 #
 # Menu entry -> install / update / remove / show link / change outway / rotate.
 # Without a terminal choose the action by environment (read by this file only):
 #   TGPROXY_ACTION=install|update|remove|link|outway|rotate|status
-#   TGPROXY_OUTWAY=<interface>|auto   TGPROXY_ROTATE=path|secret|all   TGPROXY_PURGE=1
-#   TGPROXY_TELEMT_VERSION=<image tag>  TGPROXY_PUBLIC_IP  TGPROXY_SUBNET  TGPROXY_SAVE_IMAGE=0|1
-#   TGPROXY_SCRIPTS_DIR  TGPROXY_MEM_LIMIT  TGPROXY_DRY_RUN=1 (outway commands only printed)
+#   TGPROXY_DOMAIN=<proxy name> (default: the current one, else DOMAIN)
+#   TGPROXY_OUTWAY=<interface name>|auto   TGPROXY_ROTATE=path|secret|all   TGPROXY_PURGE=1
+#   TGPROXY_TELEMT_VERSION=<image tag>  TGPROXY_PUBLIC_IP (IPv4 or IPv6)  TGPROXY_SUBNET
+#   TGPROXY_OUTWAY_FAMILIES=4|6|46 (override the detected address families of the outway)
+#   TGPROXY_SAVE_IMAGE=0|1  TGPROXY_SCRIPTS_DIR  TGPROXY_MEM_LIMIT
+#   TGPROXY_DRY_RUN=1 (outway commands only printed)
 # e.g.: TGPROXY_ACTION=link TGPROXY_OUTWAY=eth0 sudo -E ./install.sh extensions --with telegram-web-proxy
 #
 # Install phases (see extensions.d/README.md): ext_telegram_web_proxy_collect asks every
-# question (menu choice, outgoing interface, rotation, confirmations) and changes nothing;
+# question (menu choice, proxy name, outgoing interface, rotation, confirmations) and changes nothing;
 # ext_telegram_web_proxy_validate checks the answers; the install function only deploys.
 #
 # The heavy lifting is done by the standalone scripts in extensions.d/telegram-web-proxy/
@@ -110,14 +116,32 @@ _tgp_list_outways() {
     fi
 }
 
+# _tgp_fams_name FAMILIES: 4, 6 or 46 as text (technical terms, not translated).
+_tgp_fams_name() {
+    case "$1" in 46) printf 'IPv4+IPv6' ;; 6) printf 'IPv6 only' ;; 4) printf 'IPv4 only' ;; *) printf '?' ;; esac
+}
+
+# _tgp_resolve_outway ANSWER: the interface name for an answer of the prompt, which is
+# the number from the list or the name; fails for a number outside the list.
+_tgp_resolve_outway() {
+    local a=$1
+    if [[ "$a" =~ ^[0-9]+$ ]]; then
+        _tgp_have_ip || return 1
+        _tgp_outway resolve "$a" 2>/dev/null
+    else
+        printf '%s' "$a"
+    fi
+}
+
 # _tgp_pick_outway [CURRENT]: COLLECT. The chosen interface goes to TGP_OUTWAY_CHOICE
 # (TGPROXY_OUTWAY, "auto", the current one, or asked). Nothing is changed; a missing
 # answer is recorded as a problem, the value itself is checked by the validate hook.
 _tgp_pick_outway() {
-    local current="${1:-}" want="${TGPROXY_OUTWAY:-}" ans
+    local current="${1:-}" want="${TGPROXY_OUTWAY:-}" ans name
     TGP_OUTWAY_CHOICE=""
     if [[ "$want" == auto ]]; then
         want="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+        [[ -n "$want" ]] || want="$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
         if [[ -z "$want" ]]; then
             problem "$(t tgp.auto_no_route)"
             return 0
@@ -139,14 +163,60 @@ _tgp_pick_outway() {
         while :; do
             read -r -p "$(t tgp.q_outway "${current:+ [$current]}")" ans || die "$(t common.no_input)"
             ans="${ans:-$current}"
-            if [[ -n "$ans" ]] && _tgp_valid_outway "$ans"; then
-                want="$ans"
+            if [[ -n "$ans" ]] && name="$(_tgp_resolve_outway "$ans")" && _tgp_valid_outway "$name"; then
+                want="$name"
                 break
             fi
             warn "$(t tgp.bad_iface "$ans")"
+            _tgp_list_outways
         done
     fi
     TGP_OUTWAY_CHOICE="$want"
+}
+
+# _tgp_trim VALUE: VALUE without surrounding white space, lowercased.
+_tgp_trim() {
+    local v=$1
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "${v,,}"
+}
+
+# _tgp_current_domain: the proxy name of the installation (an installation made
+# before the separate name existed has none: it uses DOMAIN).
+_tgp_current_domain() {
+    local d
+    d="$(_tgp_state_get TGPROXY_DOMAIN)"
+    [[ -n "$d" ]] || d="$(_tgp_state_get DOMAIN)"
+    printf '%s' "$d"
+}
+
+# _tgp_pick_domain [CURRENT]: COLLECT. The proxy name goes to TGP_DOMAIN_CHOICE:
+# TGPROXY_DOMAIN, else asked (default CURRENT, else DOMAIN of the site), else
+# (no terminal) CURRENT or DOMAIN. The value is checked by the validate hook.
+_tgp_pick_domain() {
+    local current="${1:-}" site ans def
+    site="$(_tgp_trim "$(env_value DOMAIN)")"
+    def="${current:-$site}"
+    TGP_DOMAIN_CHOICE="$(_tgp_trim "${TGPROXY_DOMAIN:-}")"
+    if [[ -n "$TGP_DOMAIN_CHOICE" ]]; then
+        info "$(t env.from_environment TGPROXY_DOMAIN "$TGP_DOMAIN_CHOICE")"
+        return 0
+    fi
+    if ! _tgp_interactive; then
+        TGP_DOMAIN_CHOICE="$def"
+        return 0
+    fi
+    printf '\n%s\n' "$(t tgp.domain_intro "${site:-DOMAIN}")" >&2
+    while :; do
+        read -r -p "$(t tgp.q_domain "${def:+ [$def]}")" ans || die "$(t common.no_input)"
+        ans="$(_tgp_trim "${ans:-$def}")"
+        if valid_domain "$ans"; then
+            TGP_DOMAIN_CHOICE="$ans"
+            return 0
+        fi
+        warn "$(t env.invalid_value "$(t hint.domain)")"
+    done
 }
 
 # _tgp_subnet WANT: "SUBNET GATEWAY TELEMT_IP" of a free private /24 (or WANT when
@@ -188,17 +258,75 @@ print(n, h[0], h[1])
 PY
 }
 
-# _tgp_resolve_public_ip DOMAIN: TGPROXY_PUBLIC_IP, else the IPv4 address of DOMAIN
-# (fails when neither is a valid address).
-_tgp_resolve_public_ip() {
-    local domain=$1 ip="${TGPROXY_PUBLIC_IP:-}"
-    [[ -n "$ip" ]] || ip="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR == 1 {print $1}')"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+# _tgp_is_ip VALUE: an IPv4 or IPv6 address literal.
+_tgp_is_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        [[ "$1" == *:* && "$1" =~ ^[0-9A-Fa-f:.]+$ && "${1,,}" != ::ffff:* ]]
+}
+
+# _tgp_dns_ip DOMAIN: the first address of DOMAIN: A, then AAAA (getent, then dig/host
+# when installed); empty when the name resolves to nothing.
+_tgp_dns_ip() {
+    local d=$1 ip=""
+    ip="$(getent ahostsv4 "$d" 2>/dev/null | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $1; exit}' || true)"
+    [[ -n "$ip" ]] || ip="$(getent ahostsv6 "$d" 2>/dev/null | awk '$1 ~ /:/ && tolower($1) !~ /^::ffff:/ {print $1; exit}' || true)"
+    if [[ -z "$ip" ]] && command -v dig >/dev/null 2>&1; then
+        ip="$(dig +short +time=3 +tries=1 A "$d" 2>/dev/null | awk '/^[0-9]+(\.[0-9]+){3}$/ {print; exit}' || true)"
+        [[ -n "$ip" ]] || ip="$(dig +short +time=3 +tries=1 AAAA "$d" 2>/dev/null | awk '/:/ {print; exit}' || true)"
+    fi
+    if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+        ip="$(host -W 3 "$d" 2>/dev/null | awk '/ has address / {print $NF; exit}' || true)"
+        [[ -n "$ip" ]] || ip="$(host -W 3 "$d" 2>/dev/null | awk '/ has IPv6 address / {print $NF; exit}' || true)"
+    fi
+    _tgp_is_ip "$ip" || return 0
     printf '%s' "$ip"
 }
 
+# _tgp_host_ip: the source address of the host's default route (IPv4, else IPv6).
+_tgp_host_ip() {
+    local a=""
+    _tgp_have_ip || return 0
+    a="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)"
+    [[ -n "$a" ]] || a="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)"
+    _tgp_is_ip "$a" || return 0
+    printf '%s' "$a"
+}
+
+# _tgp_resolve_public_ip DOMAIN: prints "SOURCE VALUE" for the telemt public_addr (the
+# concrete address of the proxy; it is not used to build the link). Never fatal for a
+# missing record. Order: TGPROXY_PUBLIC_IP (SOURCE env; an invalid value fails), the
+# address of DOMAIN (dns: A, AAAA), the default-route address of the host (route),
+# the name itself (domain, the last resort: telemt may reject a name).
+_tgp_resolve_public_ip() {
+    local domain=$1 ip="${TGPROXY_PUBLIC_IP:-}"
+    if [[ -n "$ip" ]]; then
+        _tgp_is_ip "$ip" || return 1
+        printf 'env %s' "$ip"
+        return 0
+    fi
+    ip="$(_tgp_dns_ip "$domain")"
+    if [[ -n "$ip" ]]; then
+        printf 'dns %s' "$ip"
+        return 0
+    fi
+    ip="$(_tgp_host_ip)"
+    if [[ -n "$ip" ]]; then
+        printf 'route %s' "$ip"
+        return 0
+    fi
+    printf 'domain %s' "$domain"
+}
+
+# _tgp_public_ip DOMAIN: the value for the state. When nothing was resolved this time
+# (route/domain fallback) and the state has a value, that one is kept.
 _tgp_public_ip() {
-    _tgp_resolve_public_ip "$1" || die "$(t tgp.no_ip_for_domain "$1")"
+    local res src val old
+    res="$(_tgp_resolve_public_ip "$1")" || die "$(t tgp.bad_public_ip "${TGPROXY_PUBLIC_IP:-}")"
+    src="${res%% *}"
+    val="${res#* }"
+    old="$(_tgp_state_get PUBLIC_IP)"
+    if [[ ( "$src" == route || "$src" == domain ) && -n "$old" ]]; then val="$old"; fi
+    printf '%s' "$val"
 }
 
 # _tgp_shared_subnet PROJECT: IPv4 subnet of the project's default network (nginx/fakeapp).
@@ -222,8 +350,15 @@ _tgp_confirm() {
     [[ "${ans,,}" == y || "${ans,,}" == yes || "${ans,,}" == д || "${ans,,}" == да ]]
 }
 
+# ext_telegram_web_proxy_result: lines of the final "result data" block (stdout).
+ext_telegram_web_proxy_result() {
+    _tgp_installed || return 0
+    printf '%s\n' "$(t tgp.res_link "$(_tgp_cfg link)")"
+}
+
 _tgp_print_result() {
-    local link outway
+    local link outway domain
+    domain="$(_tgp_current_domain)"
     link="$(_tgp_cfg link)"
     outway="$(_tgp_state_get OUTWAY)"
     printf '\n' >&2
@@ -232,6 +367,13 @@ _tgp_print_result() {
     info "$(t tgp.outway_info "$outway" "$TGP_SCRIPTS_DIR")"
     warn "$(t tgp.secret_warn)"
     info "$(t tgp.client_info)"
+    if [[ "$domain" != "$(site_domain)" ]]; then
+        if have_le_cert "$domain"; then
+            info "$(t tgp.own_server_info "$domain")"
+        else
+            warn "$(t tgp.cert_missing "$domain" "$TGP_SCRIPTS_DIR")"
+        fi
+    fi
     info "$(t tgp.manage_info "$TGP_SCRIPTS_DIR")"
     [[ "$(nginx_https_port)" == 443 ]] || warn "$(t tgp.port_warn "$(nginx_https_port)")"
 }
@@ -257,7 +399,8 @@ _tgp_write_state() {
     _tgp_state_set TGPROXY_STATE_VERSION 1
     _tgp_state_set APP_DIR "$APP_DIR"
     _tgp_state_set DOMAIN "$domain"
-    _tgp_state_set PUBLIC_IP "$(_tgp_public_ip "$domain")"
+    _tgp_state_set TGPROXY_DOMAIN "${TGP_DOMAIN_CHOICE:-$domain}"
+    _tgp_state_set PUBLIC_IP "$(_tgp_public_ip "${TGP_DOMAIN_CHOICE:-$domain}")"
     _tgp_state_set COMPOSE_PROJECT "$project"
     _tgp_state_set NET_NAME "$project-tgproxy"
     _tgp_state_set SHARED_SUBNET "$(_tgp_shared_subnet "$project")"
@@ -293,13 +436,34 @@ _tgp_bring_up() {
     ext_register_compose "$TGP_ID" "$TGP_DIR/docker-compose.yml"
     _tgp_outway up
     _tgp_outway install-unit
+    # An outway that changed between IPv4 and IPv6 needs the network created again.
+    _tgp_cfg net-check
     # shellcheck disable=SC2086
     ext_compose up -d --wait $recreate telemt || {
         ext_compose logs --tail 30 telemt >&2 || true
         die "$(t tgp.unhealthy)"
     }
     _tgp_cfg check-route
-    ext_nginx_location_put "$TGP_ID" <"$TGP_DIR/nginx-location.conf"
+    _tgp_nginx_routes
+}
+
+# _tgp_nginx_routes: the nginx route of the proxy name. A separate name: its own
+# server blocks (self-signed until Let's Encrypt has issued the certificate; a
+# failure is not fatal, the renewal timer retries), the location in the server of
+# the site goes away. The name of the site: the location, and no server blocks or
+# certificate registration of this extension.
+_tgp_nginx_routes() {
+    local name
+    name="$(_tgp_current_domain)"
+    if [[ "$name" != "$(site_domain)" ]]; then
+        ext_nginx_server_put "$TGP_ID" "$name" <"$TGP_DIR/nginx-server.conf"
+        [[ ! -f "$NGINX_DATA/locations.d/$TGP_ID.conf" ]] || ext_nginx_location_rm "$TGP_ID"
+        ext_cert_request "$TGP_ID" "$name" || warn "$(t tgp.cert_failed "$name")"
+    else
+        ext_nginx_location_put "$TGP_ID" <"$TGP_DIR/nginx-location.conf"
+        ext_nginx_server_rm "$TGP_ID"
+        ext_cert_release "$TGP_ID"
+    fi
 }
 
 ext_telegram_web_proxy_do_install() {
@@ -311,6 +475,8 @@ ext_telegram_web_proxy_do_install() {
     _tgp_write_state
     _tgp_set_image "$(_tgp_state_get TELEMT_VERSION)"
     _tgp_install_scripts "$TGP_SCRIPTS_DIR"
+    # Which address families the outway carries (IPv4, IPv6, both) and the IPv6 subnet.
+    _tgp_cfg net-setup --redetect
     _tgp_bring_up
     date -u +%FT%TZ >"$TGP_MARKER"
     chmod 600 "$TGP_MARKER"
@@ -327,7 +493,12 @@ ext_telegram_web_proxy_do_update() {
         _tgp_outway check "$TGP_OUTWAY_CHOICE" || die "$(t tgp.invalid_outway "$TGP_OUTWAY_CHOICE")"
         _tgp_state_set OUTWAY "$TGP_OUTWAY_CHOICE"
         _tgp_state_set OUTWAY_GW ""
+        _tgp_state_set OUTWAY_GW6 ""
     fi
+    # The proxy name (asked in the collect phase; an old installation gets it here).
+    [[ -z "$TGP_DOMAIN_CHOICE" ]] || _tgp_state_set TGPROXY_DOMAIN "$TGP_DOMAIN_CHOICE"
+    [[ -n "$(_tgp_state_get TGPROXY_DOMAIN)" ]] || _tgp_state_set TGPROXY_DOMAIN "$(site_domain)"
+    _tgp_state_set DOMAIN "$(site_domain)"
     case "$rotate" in
         path | all) _tgp_state_set BASE_PATH "$(_tgp_rand_path)" ;;
     esac
@@ -335,9 +506,10 @@ ext_telegram_web_proxy_do_update() {
         secret | all) _tgp_state_set USER_SECRET "$(_tgp_rand_secret)" ;;
     esac
     _tgp_set_image
-    _tgp_state_set PUBLIC_IP "$(_tgp_public_ip "$(site_domain)")"
+    _tgp_state_set PUBLIC_IP "$(_tgp_public_ip "$(_tgp_current_domain)")"
     _tgp_state_set SHARED_SUBNET "$(_tgp_shared_subnet "$(_tgp_state_get COMPOSE_PROJECT)")"
     _tgp_install_scripts "$TGP_SCRIPTS_DIR"
+    if [[ -n "${TGPROXY_OUTWAY:-}" ]]; then _tgp_cfg net-setup --redetect; else _tgp_cfg net-setup; fi
     TGPROXY_FORCE_PULL=1 _tgp_bring_up --force-recreate
     new_image="$(_tgp_state_get TELEMT_IMAGE)"
     [[ "$old_image" == "$new_image" ]] || docker rmi "$old_image" >/dev/null 2>&1 || true
@@ -368,7 +540,8 @@ _tgp_do_rotate() {
 
 ext_telegram_web_proxy_menu() {
     local ans
-    printf '\n%s\n' "$(t tgp.menu_head "$(_tgp_state_get OUTWAY)")" >&2
+    printf '\n%s\n' "$(t tgp.menu_head "$(_tgp_current_domain)" "$(_tgp_state_get OUTWAY)")" >&2
+    [[ -n "$(_tgp_state_get TGPROXY_DOMAIN)" ]] || printf '%s\n' "$(t tgp.menu_old)" >&2
     printf '%s\n' "$(t tgp.menu_items)" >&2
     read -r -p "$(t tgp.menu_prompt)" ans || return 0
     case "$ans" in
@@ -386,11 +559,11 @@ ext_telegram_web_proxy_menu() {
 
 # ext_telegram_web_proxy_collect: COLLECT. Decide the action (TGPROXY_ACTION, the menu,
 # or the default) and ask everything it needs; the answers go to TGP_ACTION,
-# TGP_OUTWAY_CHOICE, TGP_ROTATE and TGP_PURGE. Changes nothing.
+# TGP_DOMAIN_CHOICE, TGP_OUTWAY_CHOICE, TGP_ROTATE and TGP_PURGE. Changes nothing.
 ext_telegram_web_proxy_collect() {
     ext_load_lang "$TGP_ID"
     local action="${TGPROXY_ACTION:-}" ans
-    TGP_ACTION="" TGP_OUTWAY_CHOICE="" TGP_ROTATE="" TGP_PURGE=0 TGP_SCRIPTS_DIR=""
+    TGP_ACTION="" TGP_OUTWAY_CHOICE="" TGP_ROTATE="" TGP_PURGE=0 TGP_SCRIPTS_DIR="" TGP_DOMAIN_CHOICE=""
     if _tgp_installed; then
         TGP_SCRIPTS_DIR="$(_tgp_state_get SCRIPTS_DIR)"
         [[ -x "$TGP_SCRIPTS_DIR/tgproxy-config.sh" ]] || TGP_SCRIPTS_DIR=""
@@ -408,8 +581,12 @@ ext_telegram_web_proxy_collect() {
     fi
     TGP_ACTION="$action"
     case "$action" in
-        install) _tgp_pick_outway "$(_tgp_state_get OUTWAY)" ;;
+        install)
+            _tgp_pick_domain "$(_tgp_state_get TGPROXY_DOMAIN)"
+            _tgp_pick_outway "$(_tgp_state_get OUTWAY)"
+            ;;
         update)
+            _tgp_pick_domain "$(_tgp_current_domain)"
             TGP_ROTATE="${TGPROXY_ROTATE:-}"
             if [[ -z "$TGP_ROTATE" ]] && _tgp_interactive; then
                 _tgp_confirm "$(t tgp.q_rotate_all)" && TGP_ROTATE=all
@@ -443,7 +620,7 @@ ext_telegram_web_proxy_collect() {
 # docker, .env and iproute2 exist (a new install). Problems are recorded with `problem`.
 ext_telegram_web_proxy_validate() {
     ext_load_lang "$TGP_ID"
-    local domain ver out dir
+    local domain ver out dir res
     case "$TGP_ACTION" in
         install | update | remove | link | outway | rotate | status | cancel) ;;
         *)
@@ -462,7 +639,12 @@ ext_telegram_web_proxy_validate() {
             [[ -n "$domain" ]] || ((ENV_NEW)) || problem "$(t tgp.no_domain "$APP_DIR/.env")"
             [[ "$APP_DIR" != *[[:space:]]* ]] || problem "$(t tgp.path_spaces "$APP_DIR")"
             if [[ -n "$TGP_OUTWAY_CHOICE" ]] && _tgp_have_ip; then
-                out="$(_tgp_outway check "$TGP_OUTWAY_CHOICE" 2>&1)" || problem "$(t tgp.outway_problem "$TGP_OUTWAY_CHOICE" "${out#error: }")"
+                if out="$(_tgp_outway check "$TGP_OUTWAY_CHOICE" 2>&1)"; then
+                    out="$(_tgp_outway families "$TGP_OUTWAY_CHOICE" 2>/dev/null || true)"
+                    info "$(t tgp.families_info "$TGP_OUTWAY_CHOICE" "$(_tgp_fams_name "$out")")"
+                else
+                    problem "$(t tgp.outway_problem "$TGP_OUTWAY_CHOICE" "${out#error: }")"
+                fi
             fi
             ;;
     esac
@@ -470,9 +652,29 @@ ext_telegram_web_proxy_validate() {
         install | update)
             ver="${TGPROXY_TELEMT_VERSION:-}"
             [[ -z "$ver" || "$ver" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || problem "$(t tgp.bad_version "$ver")"
+            # The proxy name: the name of the site, or a separate one (own certificate).
+            if [[ -n "$TGP_DOMAIN_CHOICE" ]]; then
+                if ! valid_domain "$TGP_DOMAIN_CHOICE"; then
+                    problem "$(t tgp.bad_domain "$TGP_DOMAIN_CHOICE")"
+                elif [[ "$TGP_DOMAIN_CHOICE" != "${domain,,}" ]]; then
+                    info "$(t tgp.domain_separate "$TGP_DOMAIN_CHOICE")"
+                    check_domain_dns "$TGP_DOMAIN_CHOICE"
+                    domain="$TGP_DOMAIN_CHOICE"
+                else
+                    info "$(t tgp.domain_same "$TGP_DOMAIN_CHOICE")"
+                fi
+            fi
             if valid_domain "$domain"; then
-                _tgp_resolve_public_ip "$domain" >/dev/null ||
-                    problem "$(t tgp.no_ip_for_domain "$domain")"
+                if res="$(_tgp_resolve_public_ip "$domain")"; then
+                    # A domain without an address is only a warning: the public_addr of
+                    # telemt falls back (and the Let's Encrypt check warns about the DNS).
+                    case "${res%% *}" in
+                        route) warn "$(t tgp.public_fallback "$domain" "${res#* }")" ;;
+                        domain) warn "$(t tgp.public_fallback_name "$domain" "${res#* }")" ;;
+                    esac
+                else
+                    problem "$(t tgp.bad_public_ip "${TGPROXY_PUBLIC_IP:-}")"
+                fi
             fi
             ;;
     esac

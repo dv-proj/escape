@@ -71,6 +71,7 @@ cmd_install() {
     CURRENT_STEP="$(t cmd.step_summary)"
     printf '\n%s%s%s\n' "$C_BOLD" "$(t cmd.finished)" "$C_RESET" >&2
     print_summary
+    print_results
 }
 
 cmd_extensions() {
@@ -125,6 +126,11 @@ cmd_restart() {
     compose restart
     compose up -d --wait
     check_https || true
+}
+
+cmd_info() {
+    require_installed
+    print_results
 }
 
 cmd_status() {
@@ -211,7 +217,7 @@ main() {
                 shift
                 ;;
             --lang=*) LANG_FLAG="${1#--lang=}" ;;
-            install | start | stop | restart | status | logs | renew | remove | extensions)
+            install | start | stop | restart | status | info | logs | renew | remove | extensions)
                 [[ -z "$cmd" ]] || die "$(t cmd.one_command "$cmd" "$1")"
                 cmd="$1"
                 ;;

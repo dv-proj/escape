@@ -43,6 +43,8 @@ services:
       - ../data/nginx/conf.d:/etc/nginx/conf.d:ro
       # One .conf file per extension (a location block), included in the 443 server.
       - ../data/nginx/locations.d:/etc/nginx/locations.d:ro
+      # One .conf file per extension with its own name (whole server blocks, http level).
+      - ../data/nginx/servers.d:/etc/nginx/servers.d:ro
       # ACME http-01 webroot (written by certbot).
       - ../data/nginx/webroot:/var/www/acme:ro
       # Temporary self-signed certificate, used until a real one is issued.

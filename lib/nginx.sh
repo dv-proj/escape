@@ -1,4 +1,7 @@
 # lib/nginx.sh - nginx config rendering, the nginx data directory, host port checks.
+# data/nginx/servers.d/ holds whole server blocks of extensions (their own
+# names, see ext_nginx_server_put): <id>.conf.in is the source written by the
+# extension, <id>.conf the rendered file nginx includes at http level.
 # Sourced by install.sh (see the source list there): functions and variable
 # defaults only, nothing runs at source time.
 # shellcheck shell=bash
@@ -110,16 +113,41 @@ render_nginx_conf() {
     mv -f "$tmp" "$out"
 }
 
-# prepare_nginx_dir: data/nginx/{conf.d,locations.d,webroot,selfsigned}, the
-# temporary certificate and the rendered config.
+# render_ext_servers: render every data/nginx/servers.d/<id>.conf.in into
+# <id>.conf. A first line "# cert-domain: NAME" selects the certificate that
+# replaces @SSL_CERT@ / @SSL_KEY@ (Let's Encrypt when issued, else the
+# temporary self-signed one of NAME, see ext_cert_paths).
+render_ext_servers() {
+    local dir="$NGINX_DATA/servers.d" src out name cert key content tmp
+    [[ -d "$dir" ]] || return 0
+    for src in "$dir"/*.conf.in; do
+        [[ -f "$src" ]] || continue
+        out="${src%.in}"
+        content="$(<"$src")"
+        name="$(sed -n '1s/^# cert-domain: \([A-Za-z0-9.-]*\)$/\1/p' "$src")"
+        if [[ -n "$name" ]]; then
+            read -r cert key < <(ext_cert_paths "$name")
+            content="${content//@SSL_CERT@/$cert}"
+            content="${content//@SSL_KEY@/$key}"
+        fi
+        tmp="$(mktemp "$out.XXXXXX")"
+        printf '%s\n' "$content" >"$tmp"
+        chmod 644 "$tmp"
+        mv -f "$tmp" "$out"
+    done
+}
+
+# prepare_nginx_dir: data/nginx/{conf.d,locations.d,servers.d,webroot,selfsigned},
+# the temporary certificate and the rendered configs (base and servers.d).
 prepare_nginx_dir() {
     local d owner
     owner="$(project_owner)"
-    mkdir -p "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot" "$NGINX_DATA/selfsigned" "$LE_DIR"
+    mkdir -p "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot" "$NGINX_DATA/selfsigned" "$LE_DIR"
     ensure_selfsigned "$(site_domain)"
     render_nginx_conf
-    chmod -R a+rX "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot"
-    for d in "$DATA_DIR" "$NGINX_DATA" "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot"; do
+    render_ext_servers
+    chmod -R a+rX "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot"
+    for d in "$DATA_DIR" "$NGINX_DATA" "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot"; do
         chown "$owner" "$d" 2>/dev/null || true
     done
     ok "$(t nginx.rendered "$NGINX_DATA/conf.d/default.conf" "$(have_le_cert "$(site_domain)" && t nginx.cert_le || t nginx.cert_self)")"

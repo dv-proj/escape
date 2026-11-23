@@ -89,7 +89,25 @@ print_summary() {
     printf '%s\n' "$(t app.sum_site "$domain" "$suffix" "$(nginx_http_port)" "$port" "$(fakeapp_port)")"
     printf '%s\n' "$(t app.sum_cert "$(cert_summary)")"
     printf '%s\n' "$(t app.sum_renew "$(renew_timer_state)")"
-    printf '%s\n' "$(t app.sum_random "$domain" "$suffix" "$(env_get "$envf" RANDOM_DATA_SUFFIX)")"
     printf '%s\n' "$(t app.sum_files "$(fakeapp_data_dir)")"
     printf '%s\n' "$(t app.sum_nginx "$NGINX_DATA" "$NGINX_DATA")"
+}
+
+# print_results: the final data the user needs, on stdout (so it can be copied
+# or captured): the random-data URL of the decoy app and, for every installed
+# extension that defines ext_<id>_result, its lines (e.g. the web-proxy link).
+print_results() {
+    local envf="$APP_DIR/.env" domain port suffix="" id hook
+    domain="$(site_domain)"
+    port="$(nginx_https_port)"
+    [[ "$port" == 443 ]] || suffix=":$port"
+    printf '\n%s\n' "$(t app.res_header)"
+    printf '%s\n' "$(t app.res_random "$domain" "$suffix" "$(env_get "$envf" RANDOM_DATA_SUFFIX)")"
+    for id in "${EXT_IDS[@]}"; do
+        hook="$(ext_hook "$id" result)"
+        [[ -n "$hook" ]] || continue
+        ext_load_lang "$id"
+        "$hook"
+    done
+    printf '\n'
 }

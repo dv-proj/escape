@@ -59,6 +59,12 @@ ext_example_install() {
 | `ext_unregister_compose <id>` | убирает запись `id` из `data/extensions.compose.yml`. Контейнеры сначала остановите сами (`ext_compose rm -sf <сервис>`) |
 | `ext_nginx_location_put <id>` | читает со stdin блок `location` и пишет его в `data/nginx/locations.d/<id>.conf`; если nginx запущен, проверяет конфиг (`nginx -t`) и перечитывает его (`nginx -s reload`). Если проверка не прошла, файл откатывается и скрипт завершается с ошибкой |
 | `ext_nginx_location_rm <id>` | удаляет `data/nginx/locations.d/<id>.conf` и перечитывает конфиг |
+| `ext_nginx_server_put <id> [<имя>]` | для расширения со своим DNS-именем: читает со stdin блоки `server` целиком (уровень http, свои `listen 80`/`listen 443 ssl` и `server_name`) и пишет их в `data/nginx/servers.d/<id>.conf.in`, из которого собирается `<id>.conf` (его и подключает nginx: `include /etc/nginx/servers.d/*.conf;`). С `<имя>` подстановки `@SSL_CERT@` и `@SSL_KEY@` заменяются путями сертификата этого имени: Let's Encrypt, если он уже выпущен, иначе временный самоподписанный (`data/nginx/selfsigned/<имя>/`); сборка повторяется при `renew`, `start`, `restart`, поэтому после выпуска сертификата nginx переходит на него сам. Затем `nginx -t` и перечитывание; при ошибке оба файла откатываются и скрипт завершается с ошибкой. Если работающий nginx ещё без каталога `servers.d` (установка старой версии), конфиг собирается заново и контейнер nginx однократно пересоздаётся |
+| `ext_nginx_server_rm <id>` | удаляет `data/nginx/servers.d/<id>.conf` и `.conf.in` и перечитывает конфиг |
+| `ext_cert_request <id> <имя>` | регистрирует сертификат `<имя>` за расширением (одно имя на `id`, повторный вызов заменяет; список в `data/nginx/extra-certs.list`) и получает его у Let's Encrypt тем же certbot webroot, что и сертификат `DOMAIN` (порт 80 отвечает на проверку для любого имени); затем собирает `servers.d` заново и перечитывает nginx. Имя, равное `DOMAIN`, ничего не требует. Код возврата 1, если выпустить не удалось (с подсказками); имя остаётся зарегистрированным, и `renew` (таймер) повторяет попытку. Зарегистрированные имена продлеваются вместе с `DOMAIN` |
+| `ext_cert_release <id> [--delete]` | снимает регистрацию (продление прекращается); файлы сертификата остаются, с `--delete` удаляются (сертификат `DOMAIN` и имя, зарегистрированное другим расширением, не удаляются никогда) |
+| `ext_cert_paths <имя>` | печатает `ПУТЬ_СЕРТИФИКАТА ПУТЬ_КЛЮЧА` внутри контейнера nginx для `<имя>` (Let's Encrypt или самоподписанный) |
+| `check_domain_dns <имя>` | проверка DNS, как для `DOMAIN` (только предупреждения); для фазы проверки |
 | `ext_domain` | печатает `DOMAIN` из `.env` |
 | `env_value <КЛЮЧ>` | значение из `.env`, а до его создания (фазы 1–2 новой установки) из собранных ответов |
 | `problem <текст>` | записывает фатальную проблему (фазы 1–2); все проблемы выводятся вместе, установка прекращается до развёртывания |
@@ -83,6 +89,28 @@ location /example/ {
 EOF_LOC
     info "https://$(ext_domain)/example/"
 }
+```
+
+Расширение со своим DNS-именем (например, `p.example.org` рядом с сайтом на `app.example.org`) кладёт не `location`, а свои блоки `server`:
+
+```bash
+ext_nginx_server_put example example.org <<'EOF_SRV'
+server {
+    listen 80;
+    server_name example.org;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/acme; }
+    location / { return 301 https://example.org$request_uri; }
+}
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name example.org;
+    ssl_certificate     @SSL_CERT@;
+    ssl_certificate_key @SSL_KEY@;
+    location / { proxy_pass http://example:3000; }
+}
+EOF_SRV
+ext_cert_request example example.org || warn "сертификат будет выпущен при renew"
 ```
 
 Каталог `data/` не попадает в git (`.gitignore`), общие файлы стека расширения не правят.
