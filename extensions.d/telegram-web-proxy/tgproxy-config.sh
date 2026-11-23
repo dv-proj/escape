@@ -666,6 +666,22 @@ cmd_link() {
     printf '%s\n' "$link"
 }
 
+# wait_listening [SECONDS]: telemt opens its WEB port only ~40 s after it starts (its
+# healthcheck reports ready earlier and the image has no shell), so wait until nginx
+# can connect to it; a timeout is only a warning.
+wait_listening() {
+    local secs=${1:-120} i
+    compose exec -T nginx true >/dev/null 2>&1 || return 0
+    for ((i = 0; i < secs; i += 2)); do
+        if compose exec -T nginx nc -z -w1 telemt "$LISTEN_PORT" >/dev/null 2>&1; then
+            info "telemt accepts connections on port $LISTEN_PORT (after ~${i}s)"
+            return 0
+        fi
+        sleep 2
+    done
+    warn "telemt does not listen on port $LISTEN_PORT yet (waited ${secs}s); see: docker compose logs telemt"
+}
+
 # --- default route of the container --------------------------------------------------------
 
 # check_route [--report]: the container's default routes (IPv4, and IPv6 when the
@@ -676,6 +692,7 @@ check_route() {
     local cid pid line line6 report=${1:-} bad=""
     cid="$(telemt_cid)"
     [[ -n "$cid" ]] || die "the telemt container is not running"
+    [[ "$report" == --report ]] || wait_listening
     command -v nsenter >/dev/null 2>&1 || {
         warn "nsenter not found: cannot verify the default route of the container"
         return 0
