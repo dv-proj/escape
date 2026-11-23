@@ -12,20 +12,44 @@ require_installed() {
 }
 
 # cmd_install: three explicit phases (the same for every extension):
-#   1 COLLECT  - every question is asked here (domain, e-mail, site identity,
-#                the choice of extensions, their own questions); the
-#                environment / flags override the prompts. Nothing is changed.
+#   1 COLLECT  - every question is asked here (language, install directory,
+#                domain, e-mail, site identity, the choice of extensions, their
+#                own questions); the environment / flags override the prompts.
+#                Nothing is changed.
 #   2 VALIDATE - all collected values are checked together (and the host:
 #                ports, DNS); every problem is reported at once and a fatal one
-#                aborts before anything is changed.
+#                aborts before anything is deployed.
 #   3 DEPLOY   - packages, Docker, .env, config, build, start, certificate,
 #                extensions. No questions are asked any more.
+# Run from a source checkout / download (CODE_DIR is not the install directory)
+# it is two-stage: stage 1 asks the language and the directory, validates the
+# directory, copies the project there (sync_to_install_dir) and re-executes the
+# installed install.sh (ESCAPE_STAGE2=1), which continues with the rest.
 cmd_install() {
     require_root install
-    check_system_tools
+    [[ -n "${ESCAPE_TEST_SYNC_ONLY:-}" ]] || check_system_tools
 
-    ask_language
-    phase 1 "$(t phase.collect)"
+    if [[ -z "${ESCAPE_STAGE2:-}" ]]; then
+        ask_language
+        phase 1 "$(t phase.collect)"
+        ask_install_dir
+        validate_language
+        # An unusable directory is reported now, before more questions are asked.
+        ((!${#PROBLEMS[@]})) || finish_validation
+        if [[ "$APP_DIR" != "$CODE_DIR" ]]; then
+            sync_to_install_dir
+            hand_over_to_install
+        fi
+    else
+        # Stage 2: the directory was chosen and validated by stage 1.
+        APP_DIR="${ESCAPE_DIR:?}"
+        init_paths
+        if [[ -n "${ESCAPE_TEST_SYNC_ONLY:-}" ]]; then
+            printf 'test mode (ESCAPE_TEST_SYNC_ONLY): stage 2 started in %s; stopping before the deploy\n' "$APP_DIR" >&2
+            exit 0
+        fi
+    fi
+    load_extensions
     collect_env
     collect_extensions
 
@@ -41,7 +65,10 @@ cmd_install() {
     phase 3 "$(t phase.deploy)"
     local ext_count
     ext_count=$(wc -w <<<"$EXT_SELECTED")
-    STEP_TOTAL=$((7 + ext_count))
+    STEP_TOTAL=$((8 + ext_count))
+
+    step "$(t dir.step_register "$POINTER_FILE")"
+    register_install_dir
 
     step "$(t cmd.step_prereqs "${PREREQ_PKGS[*]}")"
     install_prereqs
@@ -164,20 +191,42 @@ remove_data_dir() {
     rm -rf "$path" || warn "$(t cmd.delete_fail "$path")"
 }
 
+# remove_install_dir: delete the install directory itself (purge): only a
+# directory that carries the marker and is not a system path.
+remove_install_dir() {
+    local d="$APP_DIR"
+    is_installation "$d" && ! install_dir_is_system "$d" && [[ "$d" =~ ^/[^/]+/[^/]+ && "$d" != "$HOME" ]] ||
+        die "$(t cmd.suspicious "$d")"
+    cd /
+    rm -rf -- "${d:?}" || warn "$(t cmd.delete_fail "$d")"
+}
+
 cmd_remove() {
     require_root remove
-    STEP_TOTAL=$((PURGE ? 3 : 2))
-    local data_dir=""
+    STEP_TOTAL=$((PURGE ? 4 : 2))
+    local data_dir="" id hook
     [[ -f "$APP_DIR/.env" ]] && data_dir="$(fakeapp_data_dir)"
 
     if ((PURGE)); then
-        confirm "$(t cmd.confirm_purge "${data_dir:+$data_dir, }$NGINX_DATA, $LE_DIR")" || die "$(t common.aborted)"
+        confirm "$(t cmd.confirm_purge "${data_dir:+$data_dir, }$NGINX_DATA, $LE_DIR" "$APP_DIR")" || die "$(t common.aborted)"
     else
         confirm "$(t cmd.confirm_remove)" || die "$(t common.aborted)"
     fi
 
     step "$(t cmd.step_rm_timer)"
     remove_renew_timer
+
+    # Purge: the system files of the extensions (units, sysctl, firewall rules)
+    # go first, while the stack still runs (their hooks use compose and nginx).
+    if ((PURGE)); then
+        step "$(t cmd.step_rm_ext)"
+        for id in "${EXT_IDS[@]}"; do
+            hook="$(ext_hook "$id" purge)"
+            [[ -n "$hook" ]] || continue
+            ext_load_lang "$id"
+            "$hook" || warn "$(t cmd.ext_purge_fail "$id")"
+        done
+    fi
 
     step "$(t cmd.step_rm_containers)"
     if [[ -f "$APP_DIR/.env" ]] && command -v docker >/dev/null 2>&1 && daemon_ok; then
@@ -187,19 +236,20 @@ cmd_remove() {
     fi
 
     if ((!PURGE)); then
-        info "$(t cmd.rm_kept "${data_dir:+$data_dir, }$NGINX_DATA, $LE_DIR")"
+        info "$(t cmd.rm_kept "${data_dir:+$data_dir, }$NGINX_DATA, $LE_DIR" "$APP_DIR")"
         return 0
     fi
 
     step "$(t cmd.step_rm_data)"
     [[ -z "$data_dir" ]] || remove_data_dir "$data_dir"
-    remove_data_dir "$NGINX_DATA"
-    remove_data_dir "$LE_DIR"
-    info "$(t cmd.rm_done)"
+    unregister_install_dir
+    remove_install_dir
+    info "$(t cmd.rm_done "$APP_DIR")"
 }
 
 main() {
     local cmd="" show_help=0
+    ORIG_ARGS=("$@")
     while (($#)); do
         case "$1" in
             -h | --help | help) show_help=1 ;;
@@ -217,6 +267,12 @@ main() {
                 shift
                 ;;
             --lang=*) LANG_FLAG="${1#--lang=}" ;;
+            --dir)
+                (($# > 1)) || die "$(t cmd.dir_needs_value)"
+                DIR_FLAG="$2"
+                shift
+                ;;
+            --dir=*) DIR_FLAG="${1#--dir=}" ;;
             install | start | stop | restart | status | info | logs | renew | remove | extensions)
                 [[ -z "$cmd" ]] || die "$(t cmd.one_command "$cmd" "$1")"
                 cmd="$1"
@@ -234,8 +290,13 @@ main() {
         usage >&2
         exit 2
     }
-    load_extensions
     ((!PURGE)) || [[ "$cmd" == remove ]] || die "$(t cmd.purge_only)"
     trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+    if [[ "$cmd" != install ]]; then
+        # Every other command runs the installed copy (resolve_app_dir re-executes it).
+        resolve_app_dir
+        init_paths
+        load_extensions
+    fi
     "cmd_$cmd"
 }

@@ -24,14 +24,15 @@
 # ext_telegram_web_proxy_validate checks the answers; the install function only deploys.
 #
 # The heavy lifting is done by the standalone scripts in extensions.d/telegram-web-proxy/
-# (tgproxy-config.sh, tgproxy-outway.sh, tgproxy-remove.sh), which are also installed on
-# the host, so the proxy can be managed when this repository is not reachable.
+# (tgproxy-config.sh, tgproxy-outway.sh, tgproxy-remove.sh), which are also copied to
+# scripts/ of the install directory (TGPROXY_SCRIPTS_DIR overrides) with the path of the
+# state file baked in; the systemd units of the outway run those copies.
 
 register_extension telegram-web-proxy "Telegram web proxy (TELEMT, tg://webproxy link, selectable outgoing interface)" ext_telegram_web_proxy_install
 
 TGP_ID="telegram-web-proxy"
 TGP_TELEMT_VERSION_DEFAULT="3.5.17"
-TGP_SRC="$APP_DIR/extensions.d/telegram-web-proxy"
+TGP_SRC="$CODE_DIR/extensions.d/telegram-web-proxy"
 TGP_DIR="$DATA_DIR/telegram-web-proxy"
 TGP_STATE="$TGP_DIR/state.env"
 TGP_MARKER="$TGP_DIR/installed"
@@ -50,20 +51,13 @@ _tgp_outway() { TGPROXY_STATE="$TGP_STATE" bash "${TGP_SCRIPTS_DIR:-$TGP_SRC}/tg
 
 _tgp_interactive() { [[ -t 0 && "${ASSUME_YES:-0}" != 1 ]]; }
 
-# _tgp_scripts_dir: where the standalone scripts are installed. /opt/fakeapp-tgproxy,
-# or ~/telegram-web-proxy of the user who ran sudo; TGPROXY_SCRIPTS_DIR overrides.
+# _tgp_scripts_dir: where the standalone scripts are installed: scripts/ of the
+# install directory (APP_DIR); TGPROXY_SCRIPTS_DIR overrides.
 _tgp_scripts_dir() {
-    local home
-    if [[ -n "${TGPROXY_SCRIPTS_DIR:-}" ]]; then
-        printf '%s' "$TGPROXY_SCRIPTS_DIR"
-    elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] && home="$(getent passwd "$SUDO_USER" | cut -d: -f6)" && [[ -d "$home" ]]; then
-        printf '%s/telegram-web-proxy' "$home"
-    else
-        printf '/opt/fakeapp-tgproxy'
-    fi
+    printf '%s' "${TGPROXY_SCRIPTS_DIR:-$APP_DIR/scripts}"
 }
 
-# _tgp_install_scripts: copy the standalone scripts to the host (root-owned, 755),
+# _tgp_install_scripts: copy the standalone scripts to the scripts directory (root-owned, 755),
 # with the state file path baked in.
 _tgp_install_scripts() {
     local dir="$1" s
@@ -329,7 +323,7 @@ _tgp_public_ip() {
     printf '%s' "$val"
 }
 
-# _tgp_shared_subnet PROJECT: IPv4 subnet of the project's default network (nginx/fakeapp).
+# _tgp_shared_subnet PROJECT: IPv4 subnet of the project's default network (nginx/fakeapp service).
 _tgp_shared_subnet() {
     local nid sn
     nid="$(docker network ls -q --filter "label=com.docker.compose.project=$1" --filter "label=com.docker.compose.network=default" | head -n1)"
@@ -384,7 +378,7 @@ _tgp_write_state() {
     local domain project
     domain="$(site_domain)"
     project="$(sed -n 's/^name:[[:space:]]*\([A-Za-z0-9_-]*\).*/\1/p' "$APP_DIR/docker-compose.yml" | head -n1)"
-    project="${project:-fakeapp}"
+    project="${project:-escape}"
     local net gw tip
     # Existing values (a reinstall after "remove" without --purge) are kept: same link.
     [[ -n "$(_tgp_state_get BASE_PATH)" ]] || _tgp_state_set BASE_PATH "$(_tgp_rand_path)"
@@ -523,6 +517,16 @@ ext_telegram_web_proxy_do_remove() {
     [[ -x "$script" ]] || script="$TGP_SRC/tgproxy-remove.sh"
     ((!TGP_PURGE)) || purge=(--purge)
     TGPROXY_STATE="$TGP_STATE" bash "$script" --yes "${purge[@]}"
+}
+
+# ext_telegram_web_proxy_purge: hook of `install.sh remove --purge`: remove the proxy
+# completely (container, outway rules, systemd units, sysctl.d file, nginx route,
+# certificate of a separate name, config and secrets) while the stack still runs.
+ext_telegram_web_proxy_purge() {
+    ext_load_lang "$TGP_ID"
+    _tgp_installed || return 0
+    TGP_PURGE=1
+    ext_telegram_web_proxy_do_remove
 }
 
 _tgp_do_outway() {

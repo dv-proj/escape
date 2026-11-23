@@ -8,9 +8,8 @@
 # Registered names are listed in data/nginx/extra-certs.list ("<id> <name>" per
 # line); `renew` renews them too and issues the ones still missing.
 
-RENEW_UNIT="fakeapp-certbot-renew"
-RENEW_CRON=/etc/cron.d/fakeapp-certbot
-EXT_CERTS_FILE="$NGINX_DATA/extra-certs.list"
+RENEW_UNIT="escape-certbot-renew"
+RENEW_CRON=/etc/cron.d/escape-certbot
 
 # ensure_selfsigned DOMAIN [DIR]: temporary certificate so that nginx can start
 # before Let's Encrypt has issued the real one (kept while it matches DOMAIN).
@@ -208,7 +207,7 @@ install_renew_timer() {
     if [[ -d /run/systemd/system ]]; then
         cat >"/etc/systemd/system/$RENEW_UNIT.service" <<UNIT
 [Unit]
-Description=Renew Let's Encrypt certificates of the fakeapp stack
+Description=Renew Let's Encrypt certificates of the escape stack
 After=docker.service
 Wants=docker.service
 
@@ -218,7 +217,7 @@ ExecStart="$script" renew
 UNIT
         cat >"/etc/systemd/system/$RENEW_UNIT.timer" <<UNIT
 [Unit]
-Description=Renew Let's Encrypt certificates of the fakeapp stack twice a day
+Description=Renew Let's Encrypt certificates of the escape stack twice a day
 
 [Timer]
 OnCalendar=*-*-* 03,15:17:00
@@ -236,7 +235,7 @@ UNIT
         fi
         warn "$(t certs.timer_fail "$RENEW_UNIT.timer" "$RENEW_CRON")"
     fi
-    printf '# Renew Let'"'"'s Encrypt certificates of the fakeapp stack (installed by install.sh).\n17 3,15 * * * root "%s" renew >/dev/null 2>&1\n' "$script" >"$RENEW_CRON"
+    printf '# Renew Let'"'"'s Encrypt certificates of the escape stack (installed by install.sh).\n17 3,15 * * * root "%s" renew >/dev/null 2>&1\n' "$script" >"$RENEW_CRON"
     chmod 644 "$RENEW_CRON"
     ok "$(t certs.cron_ok "$RENEW_CRON")"
 }

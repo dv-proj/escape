@@ -10,28 +10,31 @@ nginx publishes ports 80 and 443 of the host, obtains a Let's Encrypt certificat
 
 | File | Purpose |
 |---|---|
-| `install.sh` | the single entry point: installation and management (`./install.sh <command>`). A small file: it downloads the project when run through `curl | bash` and sources the modules from `lib/` in a fixed order |
+| `install.sh` | the single entry point: installation and management (`./install.sh <command>`). A small file: it downloads the project (a tarball, no git) when run through `curl | bash` and sources the modules from `lib/` in a fixed order |
 | `lib/i18n.sh` | message language: the `t KEY` function, language choice (`--lang`, `FAKEAPP_LANG`), loading the texts of extensions (`ext_load_lang`) |
 | `lib/lang/en.sh`, `lib/lang/ru.sh` | message texts in English and Russian (identical key sets) |
-| `lib/common.sh` | output, `die`/`step`/`on_err`, phases and the problem list (`phase`, `problem`), `confirm`, the `docker compose` wrapper, shared paths |
+| `lib/common.sh` | output, `die`/`step`/`on_err`, phases and the problem list (`phase`, `problem`), `confirm`, the `docker compose` wrapper, shared paths (`init_paths`) |
+| `lib/instdir.sh` | the install directory: the question and its validation, copying the project into it (`sync_to_install_dir`, the allowlist), finding the installation (`resolve_app_dir`, the pointer file) |
 | `lib/gen.sh` | random values and the look of the decoy site (name, description, keywords) |
 | `lib/env.sh` | `.env`: value checks, questions, generation from `.env.example`, completing an existing `.env`, reading values |
 | `lib/system.sh` | OS and tool checks, package installation, Docker detection and installation |
 | `lib/nginx.sh` | building the nginx config from the template, the `data/nginx` directory, checking ports 80/443 |
-| `lib/certs.sh` | certificates: temporary self-signed, Let's Encrypt (certbot), the renewal timer, DNS check, certificates of extension names (`ext_cert_request`) |
+| `lib/certs.sh` | certificates: temporary self-signed, Let's Encrypt (certbot), the renewal timer (systemd or cron), DNS check, certificates of extension names (`ext_cert_request`) |
 | `lib/app.sh` | the project: file checks, the data directory, the site answer check, the final summary |
 | `lib/extensions.sh` | the extension framework and the `ext_*` functions for files in `extensions.d/` |
 | `lib/commands.sh` | the `install`, `start`, `stop` and other commands, the help text, `main` |
 | `extensions.d/` | installation extensions (one file per extension) and their description ([extensions.d/README.md](extensions.d/README.md)); `extensions.d/telegram-web-proxy/`: scripts of the Telegram web proxy extension, `extensions.d/<id>/lang/`: the extension's texts in two languages |
-| `tests/check-i18n.sh` | checks the message files: identical `en`/`ru` key sets, every key used in code exists in the English file |
+| `tests/check-i18n.sh` | checks the message files: identical `en`/`ru` key sets, every key used in code exists in the English file (source repository only: not copied to the install directory) |
 | `nginx/` | `docker-compose.yml` (the `nginx` service and the one-shot `certbot`) and the config template `default.conf.template` |
-| `fake-webapp/` | application sources, `Dockerfile`, description (`fake-webapp/README.md`) |
+| `fake-webapp/` | application sources, `Dockerfile`, description (`fake-webapp/README.md`), tests; only what `docker build` and the generators need is copied to the install directory |
 | `fake-webapp/gen/` | the `login.py` and `favicon.py` generators (Python 3, stdlib only); they run on the host and are not part of the image |
 | `fake-webapp/docker-compose.yml` | the `fakeapp` service |
-| `docker-compose.yml` | the main file (project `fakeapp`): `include` of `nginx/docker-compose.yml`, `fake-webapp/docker-compose.yml` and `data/extensions.compose.yml`; it knows nothing about extensions |
+| `docker-compose.yml` | the main file (project `escape`): `include` of `nginx/docker-compose.yml`, `fake-webapp/docker-compose.yml` and `data/extensions.compose.yml`; it knows nothing about extensions |
 | `.env.example` | settings template; copied to `.env` at install |
 | `README.md`, `README.en.md` | this description in Russian and in English |
-| `data/` (not in git) | `fakeapp/` (the page and files of the site), `nginx/` (generated config, `locations.d/`, `servers.d/`, `extra-certs.list`, webroot), `letsencrypt/` (certificates), `extensions.compose.yml` (generated), `telegram-web-proxy/` (extension: config and state) |
+| `data/` (in the install directory only) | `fakeapp/` (the page and files of the site), `nginx/` (generated config, `locations.d/`, `servers.d/`, `extra-certs.list`, webroot), `letsencrypt/` (certificates), `extensions.compose.yml` (generated), `telegram-web-proxy/` (extension: config, state, saved image): see [Install directory](#install-directory) |
+
+The table lists the source repository. The installation does not run from it: it is copied into the [install directory](#install-directory) (only what runs the system).
 
 ## Requirements
 
@@ -46,7 +49,11 @@ nginx publishes ports 80 and 443 of the host, obtains a Let's Encrypt certificat
 curl -fsSL https://raw.githubusercontent.com/dv-proj/escape/main/install.sh | sudo bash -s -- install
 ```
 
-The script clones the project by itself and continues the installation from there; questions are asked in the terminal. Where to clone to and from is set by environment variables (defaults in parentheses): `FAKEAPP_DIR` (`/opt/fakeapp`), `FAKEAPP_REPO` (`https://github.com/dv-proj/escape.git`), `FAKEAPP_BRANCH` (the default branch of the repository). If the directory already contains a clone, it is updated (`git pull --ff-only`). Further management: `cd /opt/fakeapp && ./install.sh <command>`. Pass your language and flags after `--`, for example `... | sudo bash -s -- --lang ru install`.
+The script downloads the repository as a tarball (`curl`, no git is needed) into a temporary directory, runs the `install.sh` from it and deletes the temporary directory on exit. Questions are asked in the terminal: first the language, then the [install directory](#install-directory) (default `/opt/escape`), then the rest. `install` copies the project into the install directory and continues from the installed copy (`/opt/escape/install.sh`); nothing else is left of the download. Pass your language and flags after `--`, for example `... | sudo bash -s -- --lang ru --dir /srv/escape install`.
+
+The download is set by environment variables (defaults in parentheses; pass them through `sudo -E` or `sudo VAR=...`): `ESCAPE_REPO_URL` (`https://codeload.github.com/dv-proj/escape`; the archive is `<ESCAPE_REPO_URL>/tar.gz/<ref>`), `ESCAPE_BRANCH` (`main`; a branch, a tag or a commit hash; `FAKEAPP_BRANCH` is a deprecated alias). Running the same one-liner again is an **update**: the code of the install directory is replaced with the downloaded one, `.env` and `data/` are kept (see [Update](#update)).
+
+Another way: clone the repository yourself and run `sudo ./install.sh install` from it. The checkout is only the source: its files are copied into the install directory by the same step, and the checkout itself is never the install directory (naming it as such is refused).
 
 ### Message language
 
@@ -54,8 +61,8 @@ The first question of `install` (and of `extensions --with` when run alone in a 
 
 The installation runs in three phases, the same for the core and for every extension:
 
-1. **Collect.** First the language choice, then all questions at once: the domain, the Let's Encrypt e-mail, the site name, description and keywords, then the menu of additional features (extensions) and the extensions' own questions (for example, the outgoing interface). Environment variables and flags replace the questions; without a terminal there are no questions. Nothing is installed or changed.
-2. **Validate.** All values are checked together before any change: the domain name, free ports 80/443, the project files, the outgoing interface and other checks of the extensions. The domain's DNS is checked with a warning (does it point to this server). All problems found are printed as one list; if any of them is serious, the installation stops before deployment starts.
+1. **Collect.** First the language choice, then the install directory, then all questions at once: the domain, the Let's Encrypt e-mail, the site name, description and keywords, then the menu of additional features (extensions) and the extensions' own questions (for example, the outgoing interface). Environment variables and flags replace the questions; without a terminal there are no questions. Nothing is installed or changed.
+2. **Validate.** All values are checked together before anything is deployed: the install directory (it is checked as soon as it is known, and the project is copied only after that), the domain name, free ports 80/443, the project files, the outgoing interface and other checks of the extensions. The domain's DNS is checked with a warning (does it point to this server). All problems found are printed as one list; if any of them is serious, the installation stops before deployment starts.
 3. **Deploy.** Only now are the packages and Docker installed, `.env` and the configuration written, the stack built and started, the certificate issued and the extensions applied. There are no more questions here.
 
 The extension menu is shown after the questions of the core. Without the menu: `--with id1,id2` (or `--with all`), or the `FAKEAPP_EXTENSIONS` variable with the same value; to install extensions separately from the main installation use `./install.sh extensions --with id`. The list: `./install.sh extensions`. How to add your own extension: [extensions.d/README.md](extensions.d/README.md).
@@ -65,6 +72,7 @@ The script asks only these questions:
 | Question | `.env` key | Default |
 |---|---|---|
 | Language: `Language / Язык: 1 - English, 2 - Russian [1]` | `FAKEAPP_LANG` | `en` |
+| Install directory (`--dir`, `ESCAPE_DIR`; not stored in `.env`) | none | `/opt/escape`, or the directory of the existing installation (the pointer file) |
 | DNS name of the site, for example `app.example.com` (required) | `DOMAIN` | none: the installation does not go on without it |
 | E-mail for Let's Encrypt (optional) | `LE_EMAIL` | empty: registration without an e-mail |
 | Site name | `APP_NAME` | a random believable one |
@@ -77,24 +85,94 @@ The script asks only these questions:
 
 The other parameters are generated randomly: `PAGE_SEED` (the look variant), `RANDOM_DATA_SUFFIX`, the request limits (`RATE_LIMIT_RPS`, `RATE_LIMIT_BURST`, `RATE_LIMIT_GLOBAL_RPS`) and the login delays (`LOGIN_DELAY_MIN_MS`, `LOGIN_DELAY_MAX_MS`). Without a terminal no questions are asked: the defaults or the environment variables with the same names are used, for example `DOMAIN=app.example.com LE_EMAIL=me@example.com sudo -E ./install.sh install`. Without `DOMAIN` a non-interactive installation fails with an error.
 
-What `install` does after the checks: it creates a temporary self-signed certificate (so that nginx starts at once), builds and starts the stack, then requests the real certificate with a one-shot certbot container and plugs it into nginx. If the certificate could not be obtained (DNS points elsewhere, port 80 is not reachable from the internet, Let's Encrypt limits), the script prints the cause and a hint, the rest of the installation is not interrupted, and nginx keeps working with the self-signed certificate. Fix the cause and run `sudo ./install.sh renew` (or repeat `install`). Certificates are stored in `data/letsencrypt/`. Renewal: the systemd timer `fakeapp-certbot-renew.timer` (twice a day it runs `./install.sh renew`: `certbot renew` and an nginx reload); if systemd is not running, an entry in `/etc/cron.d/fakeapp-certbot` is installed.
+What `install` does after the checks: it creates a temporary self-signed certificate (so that nginx starts at once), builds and starts the stack, then requests the real certificate with a one-shot certbot container and plugs it into nginx. If the certificate could not be obtained (DNS points elsewhere, port 80 is not reachable from the internet, Let's Encrypt limits), the script prints the cause and a hint, the rest of the installation is not interrupted, and nginx keeps working with the self-signed certificate. Fix the cause and run `sudo ./install.sh renew` (or repeat `install`). Certificates are stored in `data/letsencrypt/`. Renewal: the systemd timer `escape-certbot-renew.timer` (twice a day it runs `<install directory>/install.sh renew`: `certbot renew` and an nginx reload); if systemd is not running, an entry in `/etc/cron.d/escape-certbot` is installed.
 
-A repeated `install` rebuilds and restarts the stack and asks no questions (except the language, if it has not been chosen yet). It does not change the values in `.env`, it only appends new keys from `.env.example` (and writes the chosen language). It does not touch the existing `login.html` and `favicon.ico` either.
+A repeated `install` copies the project into the install directory again, rebuilds and restarts the stack and asks no questions (except the language, if it has not been chosen yet, and the directory, if it is not known). It does not change the values in `.env`, it only appends new keys from `.env.example` (and writes the chosen language). It does not touch the existing `login.html` and `favicon.ico` either.
+
+## Install directory
+
+The project never runs from a git checkout. `install` takes the sources (a checkout, or the unpacked download) and **copies an allowlist of them** into the install directory. That directory holds only what runs the system, everything the installation creates lives in it, and everything outside it is listed below.
+
+**Choosing the directory.** The second question of `install` (after the language): default `/opt/escape`; `--dir PATH` or `ESCAPE_DIR` set it without a question (`FAKEAPP_DIR` is a deprecated alias). With an existing installation the default is its directory (from the pointer file, see below). The path is checked first, before anything is copied:
+
+- absolute, only letters, digits and `. _ / + @ : -` (no spaces); not `/` or a system directory (`/usr`, `/etc`, `/var`, `/home`, `/opt`, `/tmp` itself, a user's home, ...);
+- it may not exist yet (its nearest existing parent must be writable: run as root), or be empty (or hold only `.env` and `data/` copied from an old installation), or be **an existing installation of this project** (it has the marker file `.escape-install`): then the code is updated and `.env` and `data/` are kept;
+- a non-empty directory that is not our installation is a problem with a hint: the old layout (a git checkout such as `/opt/fakeapp`) is never reused or touched, see [Migration from the old layout](#migration-from-the-old-layout); the source checkout the script runs from cannot be the install directory either.
+
+**Layout of the install directory** (`/opt/escape` by default):
+
+```text
+/opt/escape/
+├── .escape-install        marker: this directory is an installation of the project
+├── .env                   settings (mode 600); never overwritten by an update
+├── .env.example           template (new keys are appended to .env at an update)
+├── install.sh             the entry point of every command
+├── docker-compose.yml     the main compose file (project "escape")
+├── README.md, README.en.md
+├── lib/                   modules of install.sh, lib/lang/ (messages)
+├── nginx/                 docker-compose.yml (nginx, certbot), default.conf.template
+├── fake-webapp/           build context of the decoy app: Dockerfile, .dockerignore, go.mod,
+│                          *.go, docker-compose.yml, gen/login.py, gen/favicon.py (no tests)
+├── extensions.d/          extensions: <NN>-<id>.sh, <id>/ (their scripts and lang/)
+├── scripts/               standalone tgproxy-*.sh (created by the telegram-web-proxy extension)
+└── data/                  ALL runtime data (bind mounts; there are no named Docker volumes)
+    ├── fakeapp/           login.html, favicon.ico, your files (read-only in the container)
+    ├── nginx/             conf.d/, locations.d/, servers.d/, selfsigned/, webroot/, extra-certs.list
+    ├── letsencrypt/       certificates, the ACME account, the renewal config
+    ├── extensions.compose.yml   generated: the compose files of installed extensions
+    └── telegram-web-proxy/      extension: state.env, telemt/config.toml, docker-compose.yml,
+                                 nginx-*.conf, telemt-image.tar
+```
+
+There is no `.git*`, `.github`, `tests/`, editor files or `CLAUDE.md`/`AGENTS.md` in it. Everything under `data/` is yours: `install` never deletes or overwrites it. The only exception to "everything is in the install directory" is `FAKEAPP_DATA_DIR` in `.env`, if you set it yourself. The compose project is named `escape` (containers `escape-nginx-1`, `escape-fakeapp-1`, the network `escape_default`), so it does not collide with the old `fakeapp` project.
+
+**Outside the install directory** (only what cannot be inside it; `remove --purge` deletes all of it):
+
+| What | Where |
+|---|---|
+| pointer to the installation | `/etc/escape/install-dir` (the directory path; written by `install`, so commands work from any directory) |
+| the certificate renewal timer | `/etc/systemd/system/escape-certbot-renew.service` and `.timer`, or `/etc/cron.d/escape-certbot` when systemd is not running |
+| the outway of the Telegram web proxy (extension) | `/etc/systemd/system/telegram-web-proxy-outway.service`, `-outway-check.service`, `-outway.timer`; `/etc/sysctl.d/90-telegram-web-proxy.conf`; the `ip rule` / `ip -6 rule` entries, routing table 7791, the `TGPROXY-OUTWAY` firewall chains (iptables/ip6tables or the nft table `tgproxy_outway`) |
+| Docker | images (`nginx`, `certbot`, `telemt`, the built `fakeapp`), containers and networks managed by Docker; Docker itself and the apt packages are never removed |
+
+**Running commands.** The commands (`start`, `stop`, `status`, `logs`, `renew`, `remove`, `info`, `extensions`) always run the installed copy: `sudo /opt/escape/install.sh status`. Run from another directory (or from a source checkout), `install.sh` finds the installation through `--dir`, `ESCAPE_DIR`, or `/etc/escape/install-dir` and executes the installed `install.sh` with the same arguments; without any of them it stops with a hint. The renewal timer and the extension's units point to the installed copy and its `scripts/`. With several installations on one host pass `--dir` explicitly (the pointer file keeps the last one).
+
+### Update
+
+Run the one-liner again (or `sudo ./install.sh install` from a fresh checkout / download):
+
+1. the project is copied from the new sources into the install directory (the file allowlist; files that exist in the install directory's `lib/`, `nginx/`, `extensions.d/`, `fake-webapp/` but no longer in the sources are deleted, so removed modules disappear);
+2. `.env`, `data/`, `scripts/` and everything else you keep there are not touched; new keys of `.env.example` are appended to `.env`;
+3. the stack is rebuilt and restarted, the renewal timer and the extensions' scripts are refreshed.
+
+Do not edit the copied code in the install directory: the next update overwrites it. Local changes belong in the source repository.
+
+### Migration from the old layout
+
+Earlier versions ran from a git checkout in `/opt/fakeapp` (data in `data/` there, the extension's scripts in `/opt/fakeapp-tgproxy` or `~user/telegram-web-proxy`, timer `fakeapp-certbot-renew`). The new installation does not detect or change it. To move:
+
+1. Stop the old installation in its directory. If you use the Telegram web proxy, first run its `tgproxy-remove.sh` **without** `--purge` (it removes the container, the outway rules and units and the nginx route, but keeps `data/telegram-web-proxy/` with the secrets, so the link stays the same). Then `sudo ./install.sh remove` (also without `--purge`).
+2. Copy the settings and the data into the new directory: `sudo mkdir -p /opt/escape && sudo cp -a /opt/fakeapp/.env /opt/fakeapp/data /opt/escape/`. A directory that holds only `.env` and `data/` is accepted as an install directory.
+3. `sudo ./install.sh install` from a fresh checkout, or the one-liner: the code is copied into `/opt/escape`, `.env`, the site files and the certificates are reused, and the stack comes up as the new project `escape`. Ports 80/443 are free again after step 1.
+4. Telegram web proxy: choose it in the menu (or `--with telegram-web-proxy`) again: it finds the kept state, rewrites its paths (`scripts/` in the new directory, project `escape`) and installs the same link.
+5. When everything works, delete the old checkout and, if left, the old timer: `sudo systemctl disable --now fakeapp-certbot-renew.timer; sudo rm -f /etc/systemd/system/fakeapp-certbot-renew.* /etc/cron.d/fakeapp-certbot`; the old scripts directory (`/opt/fakeapp-tgproxy` or `~user/telegram-web-proxy`) is deleted by `tgproxy-remove.sh --purge` or by hand.
+
+There is no automatic migration.
 
 ## Commands
 
-General form: `./install.sh [flags] <command>`. Without a command the help is printed (exit code 2).
+General form: `install.sh [flags] <command>`. Without a command the help is printed (exit code 2). The examples below write `./install.sh`: run it from the install directory (`cd /opt/escape`) or use the full path; from anywhere else the installation is found through `/etc/escape/install-dir` (see [Install directory](#install-directory)).
 
 | Command | Action |
 |---|---|
-| `sudo ./install.sh install` | install or update (see above) |
+| `sudo ./install.sh install` | install or update (see above); from a source checkout / download it copies the project into the install directory first |
 | `./install.sh start` / `stop` / `restart` | start, stop, restart the stack (`start` and `restart` regenerate the nginx config) |
 | `./install.sh info` | print the result data again: the random-data URL of the fake app and the web-proxy connection link (also printed as a separate "Result data" block at the end of `install`) |
 | `./install.sh status` | container state, the certificate, the renewal timer and a check of `https://<DOMAIN>/` on this server (`curl --resolve` to `127.0.0.1`) |
 | `./install.sh logs` | container logs (quit with Ctrl+C) |
 | `sudo ./install.sh renew` | renew the certificates and reload the nginx config; request the certificate if there is none yet |
 | `./install.sh extensions` | the list of extensions; with `--with id,...` (root) installs them as `install` does |
-| `sudo ./install.sh remove [--purge] [-y]` | remove the containers, images and the renewal timer; with `--purge` also `data/fakeapp`, `data/nginx` and `data/letsencrypt` (including the certificates). `.env`, the project and Docker stay |
+| `sudo ./install.sh remove [--purge] [-y]` | remove the containers, images and the renewal timer; the install directory, `.env` and `data/` stay. With `--purge` everything the install made is deleted: the extensions' system files, the data (including the certificates), the whole install directory and `/etc/escape/install-dir`. Docker stays |
 
 `start`, `stop`, `restart`, `status` and `logs` need access to Docker: root, `sudo` or the `docker` group. Help: `./install.sh --help` (or `-h`, `help`); in the chosen language: `./install.sh --lang ru --help`.
 
@@ -105,12 +183,13 @@ General form: `./install.sh [flags] <command>`. Without a command the help is pr
 | `-y`, `--yes` | answer "yes" to every confirmation (for `remove`, an unsupported OS and so on); also disables the extension menu |
 | `--with IDS` | extensions without the menu: a comma list or `all`; for `install` and `extensions` (also the `FAKEAPP_EXTENSIONS` variable) |
 | `--lang en\|ru` | message language (also the `FAKEAPP_LANG` variable) |
-| `--purge` | only for `remove`: delete the data directories as well |
+| `--dir PATH` | install directory (also `ESCAPE_DIR`; default `/opt/escape`): for `install` the place to install to, for the other commands the installation to work with |
+| `--purge` | only for `remove`: delete the data and the install directory as well |
 | `-h`, `--help` | help |
 
 ### Environment variables
 
-Used when `.env` is created (instead of questions; pass them through `sudo -E` or `sudo VAR=...`): `DOMAIN`, `LE_EMAIL`, `LE_STAGING`, `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, `FAKEAPP_PORT`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`. Unset `APP_*` values are generated randomly. `TZ` is not read from the environment: the host's time zone is used (or the value typed in answer to the question). The others: `FAKEAPP_LANG` (language), `FAKEAPP_EXTENSIONS` (extensions without the menu), `FAKEAPP_DIR`, `FAKEAPP_REPO`, `FAKEAPP_BRANCH` (running through `curl | bash`), `NO_COLOR` (turn colors off). The variables of the extensions are described in their sections (`TGPROXY_*`).
+Used when `.env` is created (instead of questions; pass them through `sudo -E` or `sudo VAR=...`): `DOMAIN`, `LE_EMAIL`, `LE_STAGING`, `NGINX_HTTP_PORT`, `NGINX_HTTPS_PORT`, `FAKEAPP_PORT`, `APP_NAME`, `APP_DESCRIPTION`, `APP_KEYWORDS`. Unset `APP_*` values are generated randomly. `TZ` is not read from the environment: the host's time zone is used (or the value typed in answer to the question). The others: `FAKEAPP_LANG` (language), `FAKEAPP_EXTENSIONS` (extensions without the menu), `ESCAPE_DIR` (the install directory; `FAKEAPP_DIR` is a deprecated alias), `ESCAPE_REPO_URL`, `ESCAPE_BRANCH` (downloading through `curl | bash`; `FAKEAPP_BRANCH` is a deprecated alias), `NO_COLOR` (turn colors off). For development: `ESCAPE_TEST_SYNC_ONLY=1` makes `install` run without root, ask the questions, copy the project into the install directory, start the installed copy and stop there before anything is deployed (used to test the copy step; `ESCAPE_POINTER_FILE` replaces `/etc/escape/install-dir` in such tests). The variables of the extensions are described in their sections (`TGPROXY_*`).
 
 ### `.env` keys
 
@@ -209,11 +288,11 @@ Other containers, the decoy, nginx and the host itself keep their routes unchang
 
 **Fail-closed.** If the outway interface does not exist or is down, only `unreachable` stays in the table (for each family), and `DROP` does not let the subnet's traffic out through any other interface: the container will not reach Telegram, but nothing leaks around the outway; `tgproxy-outway.sh status` prints `BLOCKED (fail-closed)`. The rules survive a reboot: the systemd unit `telegram-web-proxy-outway.service` (oneshot, `RemainAfterExit`, after `docker.service`; on stop it switches to the "block" mode) plus the timer `telegram-web-proxy-outway.timer`, which restores the IPv4 and IPv6 routes every 30 seconds after a VPN restart (an IPv6 tunnel as well). A caveat: right after the host boots, the container may start a few seconds before the unit; in this mode TELEMT opens no outgoing connections while there are no clients. If replies over the outway get lost, check strict `rp_filter` (`net.ipv4.conf.all.rp_filter=2`): the script warns about it.
 
-**Scripts on the host.** The installation copies three self-contained scripts (they need neither `install.sh`, nor the repository, nor the network, except `docker pull` of the image) to `/opt/fakeapp-tgproxy/`, or, if the installation was started through the `sudo` of an ordinary user, to `~user/telegram-web-proxy/` (owner root, mode 755; the directory is changed with `TGPROXY_SCRIPTS_DIR`). The scripts read `data/telegram-web-proxy/state.env`:
+**Scripts on the host.** The installation copies three self-contained scripts (they need neither `install.sh`, nor the repository, nor the network, except `docker pull` of the image) to `scripts/` of the install directory (`/opt/escape/scripts/`; owner root, mode 755; the directory is changed with `TGPROXY_SCRIPTS_DIR`). The path of `state.env` is written into the copies, and the systemd units of the outway run them. The scripts read `data/telegram-web-proxy/state.env`:
 
 - `tgproxy-config.sh`: `link`, `status`, `outway [interface]` (a numbered list without the argument), `net-setup`, `net-check` (address families and the IPv6 subnet of the telemt network), `rotate path|secret|all`, `render`, `apply` (rebuild the config, load the image, apply the outway and the nginx route: the `location` or the `server` blocks of the proxy name, start the container), `cert` (the Let's Encrypt certificate of a separate proxy name through the certbot service of the project), `restart`, `pull` (`docker pull`, and if the registry is unreachable, `docker load` from the saved tar);
 - `tgproxy-outway.sh`: `up`, `block`, `down`, `status`, `list` (numbered), `names`, `resolve`, `families`, `check`, `install-unit`, `remove-unit`; `TGPROXY_DRY_RUN=1` prints the commands of both families;
-- `tgproxy-remove.sh [--yes] [--purge]`: removes the `location` or the `server` blocks of the proxy name (nginx reloads its config) and the registration of its certificate (no more renewals), the container, the network, the image, the outway rules and units, and the entry in `data/extensions.compose.yml`. The rest of the stack (nginx, the decoy) keeps running. Without `--purge` the config, `state.env`, the saved image and the certificate of a separate proxy name stay: a reinstall gives the same link and works offline; `--purge` removes them and the scripts as well (the certificate of `DOMAIN` is never touched).
+- `tgproxy-remove.sh [--yes] [--purge]`: removes the `location` or the `server` blocks of the proxy name (nginx reloads its config) and the registration of its certificate (no more renewals), the container, the network, the image, the outway rules and units, and the entry in `data/extensions.compose.yml`. The rest of the stack (nginx, the decoy) keeps running. Without `--purge` the config, `state.env`, the saved image and the certificate of a separate proxy name stay: a reinstall gives the same link and works offline; `--purge` removes them and the scripts in `scripts/` as well (the certificate of `DOMAIN` is never touched).
 
 **Security.**
 
@@ -221,11 +300,11 @@ Other containers, the decoy, nginx and the host itself keep their routes unchang
 - nginx writes no access log for this `location` (it contains client tokens) and passes TELEMT `X-Forwarded-For $remote_addr` (overwrite, not append); TELEMT trusts the header only from the compose network subnet, and port `18080` is not published.
 - Container: `read_only`, `cap_drop: ALL`, `no-new-privileges`, memory and process limits, no management API, no native MTProxy listener. Any request to other paths is answered by the decoy.
 - TELEMT resolves the address of `fakeapp` once at start: after only `fakeapp` is recreated, restart the proxy (`tgproxy-config.sh restart`; `./install.sh restart` restarts everything at once).
-- `./install.sh remove` removes the `telemt` container, but not the outway rules and units: run `tgproxy-remove.sh --purge` first.
+- `./install.sh remove` removes the `telemt` container, but not the outway rules and units: run `tgproxy-remove.sh --purge` first, or use `./install.sh remove --purge`, which calls it (the `ext_telegram_web_proxy_purge` hook) before deleting the data.
 
 ## Data directory
 
-`./data/fakeapp` (or `FAKEAPP_DATA_DIR`) is mounted into the container **read-only**: the application writes nothing.
+`<install directory>/data/fakeapp` (or `FAKEAPP_DATA_DIR`) is mounted into the container **read-only**: the application writes nothing.
 
 | File | Where from | When the application sees changes |
 |---|---|---|
@@ -252,7 +331,10 @@ A new look variant:
 ## Removal
 
 ```bash
-sudo ./install.sh remove --purge
+sudo ./install.sh remove          # containers, images, the renewal timer; the install directory and the data stay
+sudo ./install.sh remove --purge  # and everything else
 ```
 
-Removes the containers, images, the renewal timer (systemd or `/etc/cron.d/fakeapp-certbot`) and the data directories `data/fakeapp`, `data/nginx` and `data/letsencrypt` (the certificates too). Without `--purge` the data and certificates stay. Docker, `.env` and the project directory stay in any case. If you changed the ports of Xray or 3X-UI for the sake of this stack, restore them by hand.
+`remove` stops and removes the containers and images and the renewal timer (systemd or `/etc/cron.d/escape-certbot`). The install directory with `.env` and `data/` (certificates included) stays, so `install` brings the same installation back.
+
+`remove --purge` also removes the system files of the extensions (the Telegram web proxy: units, the sysctl file, firewall and routing rules), deletes the data (including `data/letsencrypt`), the **whole install directory** (only if it carries the `.escape-install` marker and is not a system path) and the pointer `/etc/escape/install-dir`, after a confirmation (`-y` skips it). Docker and the installed packages stay. If you changed the ports of Xray or 3X-UI for the sake of this stack, restore them by hand.

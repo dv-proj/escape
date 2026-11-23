@@ -14,8 +14,10 @@
 #   ext_domain, ext_compose
 # Optional hooks per extension (install phases, see cmd_install): the functions
 # ext_<id>_collect (all questions; changes nothing) and ext_<id>_validate (read-only
-# checks, report with `problem`); <id> has "-" written as "_". The install
-# function registered here runs in the deploy phase and must not ask anything.
+# checks, report with `problem`) and ext_<id>_purge (`remove --purge`: delete what
+# the extension created outside the install directory); <id> has "-" written as
+# "_". The install function registered here runs in the deploy phase and must not
+# ask anything.
 
 EXT_IDS=()
 declare -A EXT_TITLE=() EXT_FN=()
@@ -204,7 +206,7 @@ register_extension() {
 
 load_extensions() {
     local f
-    for f in "$APP_DIR"/extensions.d/*.sh; do
+    for f in "$CODE_DIR"/extensions.d/*.sh; do
         [[ -f "$f" ]] || continue
         # shellcheck disable=SC1090
         source "$f"

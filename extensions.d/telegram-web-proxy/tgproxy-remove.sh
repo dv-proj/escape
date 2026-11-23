@@ -103,8 +103,8 @@ PROJECT="$(state_get COMPOSE_PROJECT)"
 SCRIPTS_DIR="$(state_get SCRIPTS_DIR)"
 DOMAIN="$(state_get DOMAIN)"
 PROXY_NAME="$(state_get TGPROXY_DOMAIN)"
-PROJECT="${PROJECT:-fakeapp}"
-[[ -d "$APP_DIR" && -f "$APP_DIR/docker-compose.yml" ]] || die "APP_DIR '$APP_DIR' from the state file is not a fakeapp project"
+PROJECT="${PROJECT:-escape}"
+[[ -d "$APP_DIR" && -f "$APP_DIR/docker-compose.yml" ]] || die "APP_DIR '$APP_DIR' from the state file is not an escape project"
 
 if ((!YES)); then
     [[ -t 0 ]] || die "no terminal: pass --yes to confirm"
@@ -185,8 +185,8 @@ if ((PURGE)); then
     rm -rf "${TG_DIR:?}"
     info "deleted $TG_DIR"
     # The installed copies (not the ones of the repository) go away too.
-    if [[ -n "$SCRIPTS_DIR" && -d "$SCRIPTS_DIR" && "$SCRIPTS_DIR" != "$APP_DIR"/* ]] &&
-        [[ "$SCRIPTS_DIR" == */telegram-web-proxy || "$SCRIPTS_DIR" == /opt/fakeapp-tgproxy ]]; then
+    if [[ -n "$SCRIPTS_DIR" && -d "$SCRIPTS_DIR" ]] &&
+        [[ "$SCRIPTS_DIR" == "$APP_DIR/scripts" || "$SCRIPTS_DIR" == */telegram-web-proxy ]]; then
         rm -f "${SCRIPTS_DIR:?}/tgproxy-remove.sh" "${SCRIPTS_DIR:?}/tgproxy-config.sh" "${SCRIPTS_DIR:?}/tgproxy-outway.sh"
         rmdir "$SCRIPTS_DIR" 2>/dev/null || true
         info "deleted the scripts in $SCRIPTS_DIR"
