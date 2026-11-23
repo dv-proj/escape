@@ -7,17 +7,30 @@
 # is the dedicated subnet of the telemt container is affected; other containers
 # and the host keep their routes.
 #
-#   up         apply: routing table + ip rule + NAT + fail-closed firewall rules
-#   block      keep the rule and the DROP, remove the way out (fail-closed stop)
-#   down       remove everything this script created (the routes, rules, chains)
+#   up         apply: routing table + ip rule + NAT + fail-closed firewall rules,
+#              per address family (IPv4, IPv6 or both; see OUTWAY_FAMILIES below)
+#   block      keep the rules and the DROP, remove the way out (fail-closed stop)
+#   down       remove everything this script created (the routes, rules, chains,
+#              the sysctl.d file)
 #   status     show what is applied and whether telemt traffic is blocked
-#   list       list the candidate outgoing interfaces
-#   check IF   validate the interface name; exit 0 when it can be an outway
+#   list       numbered list of the candidate outgoing interfaces
+#   names      the candidate interface names, one per line (same order as `list`)
+#   resolve X  interface number (from `list`) or name -> name; exit 1 when invalid
+#   check IF   validate the interface; exit 0 when it can be an outway
+#   families IF  address families the interface can carry: 4, 6 or 46
 #   install-unit | remove-unit   systemd service + timer (survive reboots)
 #
+# An outway may carry only IPv4, only IPv6 or both (a tunnel may have no IPv4 at
+# all). The family set is detected from the global-scope addresses and the routes
+# of the interface and stored as OUTWAY_FAMILIES in the state file. The telemt
+# container network has a ULA IPv6 subnet (NET_SUBNET6) when IPv6 is used. A
+# family the outway does not carry is blocked for the container (fail closed).
+#
 # Environment: TGPROXY_STATE (state file), TGPROXY_DRY_RUN=1 (print the
-# ip/iptables/nft commands instead of running them), TGPROXY_FW=iptables|nft,
-# TGPROXY_DRY_ASSUME_UP=1 (dry run: pretend the outway is up, for tests).
+# ip/iptables/ip6tables/nft/sysctl commands instead of running them),
+# TGPROXY_FW=iptables|nft, TGPROXY_DRY_ASSUME_UP=1 (dry run: pretend the outway
+# is up, for tests), TGPROXY_OUTWAY_FAMILIES=4|6|46 (override the detection),
+# TGPROXY_SYSCTL_DIR (default /etc/sysctl.d).
 set -Eeuo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -32,7 +45,9 @@ CHAIN="TGPROXY-OUTWAY"
 NFT_TABLE="tgproxy_outway"
 UNIT="telegram-web-proxy-outway"
 UNIT_DIR="${TGPROXY_UNIT_DIR:-/etc/systemd/system}"
-ROUTE_STATE=""
+SYSCTL_FILE="${TGPROXY_SYSCTL_DIR:-/etc/sysctl.d}/90-telegram-web-proxy.conf"
+ROUTE_STATE_4="" ROUTE_STATE_6=""
+WARNED_DOWN=0
 
 say() { printf '%s\n' "$*" >&2; }
 note() { ((QUIET)) || say "    $*"; }
@@ -73,11 +88,17 @@ iface_names() {
 
 iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
 iface_flags() { ip -o link show dev "$1" 2>/dev/null | sed -n 's/.*<\([^>]*\)>.*/\1/p'; }
+iface_oper() { ip -o link show dev "$1" 2>/dev/null | sed -n 's/.* state \([A-Z-]*\).*/\1/p' | head -n1; }
+# iface_up IF: administratively up, with a carrier. Tunnels (tun, wg, ppp, ...)
+# report operstate UNKNOWN: that counts as up.
 iface_up() {
-    local flags
+    local flags oper
     if [[ "$DRY" == 1 && "${TGPROXY_DRY_ASSUME_UP:-0}" == 1 ]]; then return 0; fi
     flags="$(iface_flags "$1")"
-    [[ ",$flags," == *,UP,* && ",$flags," == *,LOWER_UP,* ]]
+    [[ ",$flags," == *,UP,* && ",$flags," != *,NO-CARRIER,* ]] || return 1
+    [[ ",$flags," == *,LOWER_UP,* ]] && return 0
+    oper="$(iface_oper "$1")"
+    [[ "$oper" == UP || "$oper" == UNKNOWN ]]
 }
 iface_ptp() {
     local flags
@@ -85,40 +106,123 @@ iface_ptp() {
     [[ ",$flags," == *,POINTOPOINT,* || "$1" == tun* || "$1" == wg* || "$1" == ppp* || "$1" == tailscale* ]]
 }
 
+# iface_addrs FAMILY IF: global-scope addresses (a point-to-point "peer" is skipped).
+iface_addrs() {
+    ip -o "-$1" addr show dev "$2" scope global 2>/dev/null |
+        awk '{for (i = 1; i < NF; i++) if ($i == "inet" || $i == "inet6") {print $(i + 1); break}}' || true
+}
+# iface_routes FAMILY IF: routes through the device, without link-local noise.
+iface_routes() {
+    ip "-$1" route show dev "$2" 2>/dev/null | grep -Ev '^(fe80:|ff00:|169\.254\.)' || true
+}
+# iface_families IF: "4", "6", "46" or "" (global addresses, or else routes: a tunnel
+# without an address still carries a family when it has routes).
+iface_families() {
+    local f out=""
+    for f in 4 6; do
+        if [[ -n "$(iface_addrs "$f" "$1")" || -n "$(iface_routes "$f" "$1")" ]]; then out+=$f; fi
+    done
+    printf '%s' "$out"
+}
+# families_of IF: the detection, or TGPROXY_OUTWAY_FAMILIES when set.
+families_of() {
+    local o="${TGPROXY_OUTWAY_FAMILIES:-}"
+    if [[ -n "$o" ]]; then
+        [[ "$o" =~ ^(4|6|46)$ ]] || die "bad TGPROXY_OUTWAY_FAMILIES '$o' (4, 6 or 46)"
+        printf '%s' "$o"
+    else
+        iface_families "$1"
+    fi
+}
+fams_name() {
+    case "$1" in 46) printf 'IPv4+IPv6' ;; 6) printf 'IPv6 only' ;; 4) printf 'IPv4 only' ;; *) printf 'none' ;; esac
+}
+
+# iface_default_note IF: which families have the host's main default route on IF.
+iface_default_note() {
+    local d4 d6
+    d4="$(ip -4 route show default dev "$1" 2>/dev/null | head -n1 || true)"
+    d6="$(ip -6 route show default dev "$1" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$d4" && -n "$d6" ]]; then
+        printf 'main default route of the host (IPv4+IPv6)'
+    elif [[ -n "$d4" ]]; then
+        printf 'main default route of the host (IPv4)'
+    elif [[ -n "$d6" ]]; then
+        printf 'main default route of the host (IPv6)'
+    fi
+}
+
 cmd_list() {
-    local n def addr st
-    printf '%-14s %-6s %-20s %s\n' INTERFACE STATE ADDRESS ROUTE >&2
+    local n i=0 addr st
+    printf '%-4s %-14s %-6s %-44s %s\n' '#' INTERFACE STATE ADDRESS ROUTE >&2
     while read -r n; do
+        i=$((i + 1))
         st=DOWN
         iface_up "$n" && st=UP
-        addr="$(ip -o -4 addr show dev "$n" 2>/dev/null | awk '{print $4; exit}')"
-        def="$(ip -4 route show default dev "$n" 2>/dev/null | head -n1)"
-        printf '%-14s %-6s %-20s %s\n' "$n" "$st" "${addr:--}" "${def:+main default route of the host}" >&2
+        addr="$({ iface_addrs 4 "$n"; iface_addrs 6 "$n"; } | paste -sd, -)"
+        printf '%-4s %-14s %-6s %-44s %s\n' "$i)" "$n" "$st" "${addr:--}" "$(iface_default_note "$n")" >&2
     done < <(iface_names)
 }
 
+# cmd_resolve ANSWER: a number from `list` or an interface name -> the name.
+cmd_resolve() {
+    local a=${1:-} name
+    if [[ "$a" =~ ^[0-9]+$ ]]; then
+        [[ "$a" =~ ^[1-9][0-9]*$ ]] || die "no interface number $a in the list"
+        name="$(iface_names | sed -n "${a}p")"
+        [[ -n "$name" ]] || die "no interface number $a in the list"
+        printf '%s\n' "$name"
+    else
+        valid_iface "$a" || die "bad interface name '$a'"
+        printf '%s\n' "$a"
+    fi
+}
+
 cmd_check() {
-    local n=${1:-}
+    local n=${1:-} fams
     valid_iface "$n" || die "bad interface name '$n'"
     ! excluded_iface "$n" || die "'$n' cannot be an outway (lo, docker*, br-*, veth*, virbr* are excluded)"
     iface_exists "$n" || die "interface '$n' does not exist (see: $0 list)"
+    fams="$(families_of "$n")"
+    [[ -n "$fams" ]] || die "'$n' has no global IPv4/IPv6 address and no route: configure it first (or set TGPROXY_OUTWAY_FAMILIES=4|6|46 when it gets them later)"
+}
+
+cmd_families() {
+    local n=${1:-} fams
+    cmd_check "$n"
+    fams="$(families_of "$n")"
+    printf '%s\n' "$fams"
 }
 
 # --- state ----------------------------------------------------------------------------
 
-OUTWAY="" SUBNET="" TABLE="" PRIO="" GW_OVERRIDE=""
+OUTWAY="" SUBNET="" SUBNET6="" TABLE="" PRIO="" GW_OVERRIDE="" GW6_OVERRIDE="" FAMILIES=""
 load_state() {
     [[ -f "$STATE_FILE" ]] || die "state file not found: $STATE_FILE"
     OUTWAY="$(state_get OUTWAY)"
     SUBNET="$(state_get NET_SUBNET)"
+    SUBNET6="$(state_get NET_SUBNET6)"
     TABLE="$(state_get ROUTE_TABLE)"
     PRIO="$(state_get RULE_PRIO)"
     GW_OVERRIDE="$(state_get OUTWAY_GW)"
+    GW6_OVERRIDE="$(state_get OUTWAY_GW6)"
+    FAMILIES="$(state_get OUTWAY_FAMILIES)"
     TABLE="${TABLE:-7791}"
     PRIO="${PRIO:-7791}"
     [[ "$SUBNET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "NET_SUBNET missing or invalid in $STATE_FILE"
+    [[ -z "$SUBNET6" || "$SUBNET6" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || die "NET_SUBNET6 invalid in $STATE_FILE"
     [[ "$TABLE" =~ ^[0-9]+$ && "$PRIO" =~ ^[0-9]+$ ]] || die "ROUTE_TABLE/RULE_PRIO invalid in $STATE_FILE"
     valid_iface "$OUTWAY" || die "OUTWAY missing or invalid in $STATE_FILE"
+    if [[ -z "$FAMILIES" ]]; then
+        # An installation without the setting (older version): the outway is IPv4.
+        FAMILIES=4
+    fi
+    [[ "$FAMILIES" =~ ^(4|6|46)$ ]] || die "OUTWAY_FAMILIES invalid in $STATE_FILE (4, 6 or 46)"
+}
+
+# egress FAMILY: 1 when the container's family-FAMILY traffic may leave through the outway.
+egress() {
+    if [[ "$FAMILIES" == *"$1"* ]] && { [[ "$1" == 4 ]] || [[ -n "$SUBNET6" ]]; }; then printf 1; else printf 0; fi
 }
 
 fw_backend() {
@@ -134,6 +238,9 @@ fw_backend() {
         fi
     fi
     [[ "$b" == iptables || "$b" == nft ]] || die "bad firewall backend '$b'"
+    if [[ "$b" == iptables && -n "$SUBNET6" && "$DRY" != 1 ]] && ! command -v ip6tables >/dev/null 2>&1; then
+        die "IPv6 is used but ip6tables is not installed (install it, or set TGPROXY_FW=nft)"
+    fi
     printf '%s' "$b"
 }
 
@@ -144,144 +251,258 @@ outway_usable() {
     iface_exists "$OUTWAY" && iface_up "$OUTWAY"
 }
 
-# apply_routes MODE: MODE up = default via the outway, block = unreachable only.
-apply_routes() {
-    local mode=$1 line gw="" onlink=""
+# rule_present FAMILY SUBNET
+rule_present() {
+    ip "-$1" rule show | grep -Eq "^${PRIO}:[[:space:]]+from ${2//./\\.} lookup ${TABLE}([[:space:]]|\$)"
+}
+
+# apply_routes_family FAMILY SUBNET EGRESS MODE: in the dedicated table, default via the
+# outway (MODE up and the outway carries FAMILY), else only "unreachable".
+apply_routes_family() {
+    local f=$1 subnet=$2 eg=$3 mode=$4 line gw="" onlink="" over st
     # Fail-closed fallback: when the outway route is missing, the lookup in this
     # table ends in "unreachable" and never falls through to the main table.
-    run ip route replace unreachable default metric 4096 table "$TABLE"
-    if [[ "$mode" == up ]] && outway_usable; then
-        if [[ -n "$GW_OVERRIDE" ]]; then
-            [[ "$GW_OVERRIDE" == - ]] || gw="$GW_OVERRIDE"
+    run ip "-$f" route replace unreachable default metric 4096 table "$TABLE"
+    if [[ "$mode" == up && "$eg" == 1 ]] && outway_usable; then
+        over="$GW_OVERRIDE"
+        [[ "$f" == 4 ]] || over="$GW6_OVERRIDE"
+        if [[ -n "$over" ]]; then
+            [[ "$over" == - ]] || gw="$over"
         elif ! iface_ptp "$OUTWAY"; then
-            line="$(ip -4 route show default dev "$OUTWAY" 2>/dev/null | head -n1 || true)"
-            if [[ "$line" =~ via[[:space:]]+([0-9.]+) ]]; then
+            line="$(ip "-$f" route show default dev "$OUTWAY" 2>/dev/null | head -n1 || true)"
+            if [[ "$line" =~ via[[:space:]]+([0-9a-fA-F.:]+) ]]; then
                 gw="${BASH_REMATCH[1]}"
                 [[ "$line" == *onlink* ]] && onlink=onlink
             else
-                note "no default gateway found for $OUTWAY: using 'default dev $OUTWAY' (set OUTWAY_GW in $STATE_FILE if needed)"
+                note "no IPv$f default gateway found for $OUTWAY: using 'default dev $OUTWAY' (set OUTWAY_GW$([[ "$f" == 6 ]] && printf 6) in $STATE_FILE if needed)"
             fi
         fi
         if [[ -n "$gw" ]]; then
             # shellcheck disable=SC2086
-            run ip route replace default via "$gw" dev "$OUTWAY" ${onlink:+$onlink} metric 100 table "$TABLE"
+            run ip "-$f" route replace default via "$gw" dev "$OUTWAY" ${onlink:+$onlink} metric 100 table "$TABLE"
         else
-            run ip route replace default dev "$OUTWAY" metric 100 table "$TABLE"
+            run ip "-$f" route replace default dev "$OUTWAY" metric 100 table "$TABLE"
         fi
-        ROUTE_STATE="up"
+        st="up"
     else
-        try ip route del default metric 100 table "$TABLE"
-        if [[ "$mode" == up ]]; then
-            ROUTE_STATE="down"
-            warn "outway '$OUTWAY' is down or missing: telemt traffic is blocked (fail-closed) until it is back"
+        try ip "-$f" route del default metric 100 table "$TABLE"
+        if [[ "$mode" != up ]]; then
+            st="blocked"
+        elif [[ "$eg" != 1 ]]; then
+            st="blocked (the outway has no IPv$f)"
         else
-            ROUTE_STATE="blocked"
+            st="down"
+            if ((!WARNED_DOWN)); then
+                WARNED_DOWN=1
+                warn "outway '$OUTWAY' is down or missing: telemt traffic is blocked (fail-closed) until it is back"
+            fi
         fi
     fi
     if [[ "$DRY" == 1 ]]; then
-        printf '+ ip rule add from %s lookup %s priority %s   # skipped when already present\n' "$SUBNET" "$TABLE" "$PRIO"
-    elif ! ip rule show | grep -Eq "^${PRIO}:[[:space:]]+from ${SUBNET//./\\.} lookup ${TABLE}\$"; then
-        ip rule add from "$SUBNET" lookup "$TABLE" priority "$PRIO"
+        printf '+ ip -%s rule add from %s lookup %s priority %s   # skipped when already present\n' "$f" "$subnet" "$TABLE" "$PRIO"
+    elif ! rule_present "$f" "$subnet"; then
+        ip "-$f" rule add from "$subnet" lookup "$TABLE" priority "$PRIO"
     fi
+    if [[ "$f" == 4 ]]; then ROUTE_STATE_4="$st"; else ROUTE_STATE_6="$st"; fi
+}
+
+# apply_routes MODE: up = default via the outway, block = unreachable only.
+apply_routes() {
+    apply_routes_family 4 "$SUBNET" "$(egress 4)" "$1"
+    if [[ -n "$SUBNET6" ]]; then apply_routes_family 6 "$SUBNET6" "$(egress 6)" "$1"; fi
 }
 
 remove_routes() {
-    if [[ "$DRY" == 1 ]]; then
-        printf '+ ip rule del from %s lookup %s priority %s\n' "$SUBNET" "$TABLE" "$PRIO"
-    else
-        while ip rule del from "$SUBNET" lookup "$TABLE" priority "$PRIO" 2>/dev/null; do :; done
-    fi
-    try ip route flush table "$TABLE"
+    local f subnet
+    for f in 4 6; do
+        subnet="$SUBNET"
+        [[ "$f" == 4 ]] || subnet="$SUBNET6"
+        if [[ -n "$subnet" ]]; then
+            if [[ "$DRY" == 1 ]]; then
+                printf '+ ip -%s rule del from %s lookup %s priority %s\n' "$f" "$subnet" "$TABLE" "$PRIO"
+            else
+                while ip "-$f" rule del from "$subnet" lookup "$TABLE" priority "$PRIO" 2>/dev/null; do :; done
+            fi
+        fi
+        try ip "-$f" route flush table "$TABLE"
+    done
 }
 
-# --- firewall: iptables ----------------------------------------------------------------
+# --- IPv6 forwarding (sysctl.d file owned by this script) ------------------------------------------
 
-# ipt_ensure_jump TABLE PARENT ARGS...: insert "-j CHAIN" in PARENT unless present.
+# ensure_v6_forwarding: net.ipv6.conf.all.forwarding=1 now and after a reboot. Forwarding
+# makes the kernel ignore router advertisements on interfaces with accept_ra=1, so
+# interfaces that hold an RA-learnt default route get accept_ra=2 first.
+ensure_v6_forwarding() {
+    local content ifc cur ra="" tmp
+    if [[ -e "$SYSCTL_FILE" && "$DRY" != 1 ]]; then
+        [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == 1 ]] && return 0
+    else
+        if [[ "$DRY" != 1 ]]; then
+            while read -r ifc; do
+                [[ -n "$ifc" ]] || continue
+                cur="$(sysctl -n "net.ipv6.conf.${ifc//./\/}.accept_ra" 2>/dev/null || echo 2)"
+                [[ "$cur" != 1 ]] || ra+="net.ipv6.conf.${ifc//./\/}.accept_ra = 2"$'\n'
+            done < <(ip -6 route show default 2>/dev/null | awk '/proto ra/ {for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u)
+        fi
+        content="# Generated by tgproxy-outway.sh (telegram-web-proxy): IPv6 forwarding for the telemt container.
+# Removed by tgproxy-remove.sh.
+${ra}net.ipv6.conf.all.forwarding = 1"
+        if [[ "$DRY" == 1 ]]; then
+            printf '+ write %s:\n%s\n' "$SYSCTL_FILE" "$(sed 's/^/+   /' <<<"$content")"
+            printf '+ sysctl -q -p %s\n' "$SYSCTL_FILE"
+            return 0
+        fi
+        if mkdir -p "$(dirname "$SYSCTL_FILE")" && tmp="$(mktemp "$SYSCTL_FILE.XXXXXX")" &&
+            printf '%s\n' "$content" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$SYSCTL_FILE"; then
+            :
+        else
+            warn "cannot write $SYSCTL_FILE: set net.ipv6.conf.all.forwarding=1 persistently by hand"
+        fi
+    fi
+    if ! sysctl -q -p "$SYSCTL_FILE" >/dev/null 2>&1 || [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" != 1 ]]; then
+        warn "cannot set net.ipv6.conf.all.forwarding=1: IPv6 traffic of telemt will not be forwarded (run: sysctl -w net.ipv6.conf.all.forwarding=1)"
+    fi
+}
+
+remove_v6_forwarding() {
+    [[ -e "$SYSCTL_FILE" ]] || return 0
+    run rm -f "$SYSCTL_FILE"
+}
+
+# --- firewall: iptables / ip6tables ---------------------------------------------------------------
+
+# ipt_ensure_jump BIN TABLE PARENT ARGS...: insert "-j CHAIN" in PARENT unless present.
 ipt_ensure_jump() {
-    local t=$1 parent=$2
-    shift 2
+    local bin=$1 t=$2 parent=$3
+    shift 3
     if [[ "$DRY" == 1 ]]; then
-        printf '+ iptables -t %s -I %s 1 %s -j %s   # skipped when already present\n' "$t" "$parent" "$*" "$CHAIN"
-    elif ! iptables -t "$t" -C "$parent" "$@" -j "$CHAIN" 2>/dev/null; then
-        iptables -t "$t" -I "$parent" 1 "$@" -j "$CHAIN"
+        printf '+ %s -t %s -I %s 1 %s -j %s   # skipped when already present\n' "$bin" "$t" "$parent" "$*" "$CHAIN"
+    elif ! "$bin" -t "$t" -C "$parent" "$@" -j "$CHAIN" 2>/dev/null; then
+        "$bin" -t "$t" -I "$parent" 1 "$@" -j "$CHAIN"
     fi
 }
 
 ipt_filter_parent() {
-    if [[ "$DRY" == 1 ]] || iptables -t filter -S DOCKER-USER >/dev/null 2>&1; then
+    if [[ "$DRY" == 1 ]] || "$1" -t filter -S DOCKER-USER >/dev/null 2>&1; then
         printf 'DOCKER-USER'
     else
         printf 'FORWARD'
     fi
 }
 
-ipt_apply() {
-    local mode=$1 parent
-    parent="$(ipt_filter_parent)"
-    # nat: MASQUERADE out of the outway only
-    try iptables -t nat -N "$CHAIN"
-    run iptables -t nat -F "$CHAIN"
-    run iptables -t nat -A "$CHAIN" -s "$SUBNET" -o "$OUTWAY" -m comment --comment tgproxy-outway -j MASQUERADE
-    ipt_ensure_jump nat POSTROUTING -s "$SUBNET"
-    # filter: nothing from the subnet may leave through any other interface
-    try iptables -t filter -N "$CHAIN"
-    run iptables -t filter -F "$CHAIN"
-    if [[ "$mode" == up ]]; then
-        run iptables -t filter -A "$CHAIN" -s "$SUBNET" ! -o "$OUTWAY" -m comment --comment tgproxy-outway -j DROP
-    else
-        run iptables -t filter -A "$CHAIN" -s "$SUBNET" -m comment --comment tgproxy-outway -j DROP
+# ipt_apply_family BIN SUBNET EGRESS MODE
+ipt_apply_family() {
+    local bin=$1 subnet=$2 eg=$3 mode=$4 parent
+    parent="$(ipt_filter_parent "$bin")"
+    if [[ "$bin" == ip6tables && "$DRY" != 1 ]]; then
+        "$bin" -t nat -S >/dev/null 2>&1 || die "the ip6tables nat table is not available (modprobe ip6table_nat)"
+        if [[ "$parent" == FORWARD ]]; then
+            # Docker runs with ip6tables disabled: it adds no IPv6 rules at all. The
+            # masquerade is added here; the forwarding itself must be allowed.
+            note "Docker has no IPv6 firewall chains (ip6tables disabled in the daemon): the MASQUERADE and the DROP rules are added here"
+            if "$bin" -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP'; then
+                warn "the ip6tables FORWARD policy is DROP: allow forwarding for $subnet, or enable \"ip6tables\": true in the Docker daemon"
+            fi
+        fi
     fi
-    ipt_ensure_jump filter "$parent" -s "$SUBNET"
+    # nat: MASQUERADE out of the outway only
+    try "$bin" -t nat -N "$CHAIN"
+    run "$bin" -t nat -F "$CHAIN"
+    if [[ "$eg" == 1 ]]; then
+        run "$bin" -t nat -A "$CHAIN" -s "$subnet" -o "$OUTWAY" -m comment --comment tgproxy-outway -j MASQUERADE
+    fi
+    ipt_ensure_jump "$bin" nat POSTROUTING -s "$subnet"
+    # filter: nothing from the subnet may leave through any other interface
+    try "$bin" -t filter -N "$CHAIN"
+    run "$bin" -t filter -F "$CHAIN"
+    if [[ "$mode" == up && "$eg" == 1 ]]; then
+        run "$bin" -t filter -A "$CHAIN" -s "$subnet" ! -o "$OUTWAY" -m comment --comment tgproxy-outway -j DROP
+    else
+        run "$bin" -t filter -A "$CHAIN" -s "$subnet" -m comment --comment tgproxy-outway -j DROP
+    fi
+    ipt_ensure_jump "$bin" filter "$parent" -s "$subnet"
 }
 
-ipt_remove() {
-    local parent
-    for parent in DOCKER-USER FORWARD; do
-        if [[ "$DRY" == 1 ]]; then
-            printf '+ iptables -t filter -D %s -s %s -j %s\n' "$parent" "$SUBNET" "$CHAIN"
-        else
-            while iptables -t filter -D "$parent" -s "$SUBNET" -j "$CHAIN" 2>/dev/null; do :; done
-        fi
-    done
+# ipt_purge_jumps BIN TABLE PARENT: delete every "-j CHAIN" rule of PARENT (any subnet).
+ipt_purge_jumps() {
+    local bin=$1 t=$2 parent=$3 r
+    local -a a
+    while IFS= read -r r; do
+        [[ "$r" == "-A $parent "* && "$r" == *" -j $CHAIN" ]] || continue
+        read -ra a <<<"${r/-A/-D}"
+        "$bin" -t "$t" "${a[@]}" 2>/dev/null || true
+    done < <("$bin" -t "$t" -S "$parent" 2>/dev/null || true)
+}
+
+# ipt_remove_family BIN SUBNET
+ipt_remove_family() {
+    local bin=$1 subnet=$2 parent
     if [[ "$DRY" == 1 ]]; then
-        printf '+ iptables -t nat -D POSTROUTING -s %s -j %s\n' "$SUBNET" "$CHAIN"
+        for parent in DOCKER-USER FORWARD; do
+            printf '+ %s -t filter -D %s -s %s -j %s\n' "$bin" "$parent" "$subnet" "$CHAIN"
+        done
+        printf '+ %s -t nat -D POSTROUTING -s %s -j %s\n' "$bin" "$subnet" "$CHAIN"
     else
-        while iptables -t nat -D POSTROUTING -s "$SUBNET" -j "$CHAIN" 2>/dev/null; do :; done
+        command -v "$bin" >/dev/null 2>&1 || return 0
+        for parent in DOCKER-USER FORWARD; do ipt_purge_jumps "$bin" filter "$parent"; done
+        ipt_purge_jumps "$bin" nat POSTROUTING
     fi
-    try iptables -t filter -F "$CHAIN"
-    try iptables -t filter -X "$CHAIN"
-    try iptables -t nat -F "$CHAIN"
-    try iptables -t nat -X "$CHAIN"
+    try "$bin" -t filter -F "$CHAIN"
+    try "$bin" -t filter -X "$CHAIN"
+    try "$bin" -t nat -F "$CHAIN"
+    try "$bin" -t nat -X "$CHAIN"
+}
+
+ipt_apply() {
+    ipt_apply_family iptables "$SUBNET" "$(egress 4)" "$1"
+    if [[ -n "$SUBNET6" ]]; then ipt_apply_family ip6tables "$SUBNET6" "$(egress 6)" "$1"; fi
+}
+ipt_remove() {
+    ipt_remove_family iptables "$SUBNET"
+    # IPv6 leftovers are removed whether or not the state still has NET_SUBNET6.
+    if [[ -n "$SUBNET6" || "$DRY" != 1 ]]; then ipt_remove_family ip6tables "$SUBNET6"; fi
+}
+
+# purge_stale_v6: the container network is IPv4-only now (the outway was changed or its
+# IPv6 is gone): remove the IPv6 rules, chains and routes left by an earlier run.
+purge_stale_v6() {
+    [[ "$DRY" != 1 ]] || return 0
+    ip -6 rule show 2>/dev/null | grep -q "^${PRIO}:" || return 0
+    if [[ "$(fw_backend)" == iptables ]]; then ipt_remove_family ip6tables ""; else try nft delete table ip6 "$NFT_TABLE"; fi
+    while ip -6 rule del priority "$PRIO" lookup "$TABLE" 2>/dev/null; do :; done
+    ip -6 route flush table "$TABLE" 2>/dev/null || true
 }
 
 # --- firewall: nft (hosts without iptables) -------------------------------------------------
 
-nft_apply() {
-    local mode=$1 drop rules
-    if [[ "$mode" == up ]]; then
-        drop="ip saddr $SUBNET oifname != \"$OUTWAY\" counter drop comment \"tgproxy-outway\""
+# nft_table FAMILY(ip|ip6) SUBNET EGRESS MODE: add/delete/define one table.
+nft_table() {
+    local fam=$1 subnet=$2 eg=$3 mode=$4 drop masq=""
+    if [[ "$mode" == up && "$eg" == 1 ]]; then
+        drop="$fam saddr $subnet oifname != \"$OUTWAY\" counter drop comment \"tgproxy-outway\""
     else
-        drop="ip saddr $SUBNET counter drop comment \"tgproxy-outway\""
+        drop="$fam saddr $subnet counter drop comment \"tgproxy-outway\""
     fi
-    rules="add table ip $NFT_TABLE
-delete table ip $NFT_TABLE
-table ip $NFT_TABLE {
-    chain post {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr $SUBNET oifname \"$OUTWAY\" counter masquerade comment \"tgproxy-outway\"
-    }
-    chain fwd {
-        type filter hook forward priority -10; policy accept;
-        $drop
-    }
-}"
+    [[ "$eg" != 1 ]] || masq="$fam saddr $subnet oifname \"$OUTWAY\" counter masquerade comment \"tgproxy-outway\""
+    printf 'add table %s %s\ndelete table %s %s\ntable %s %s {\n    chain post {\n        type nat hook postrouting priority srcnat; policy accept;\n        %s\n    }\n    chain fwd {\n        type filter hook forward priority -10; policy accept;\n        %s\n    }\n}\n' \
+        "$fam" "$NFT_TABLE" "$fam" "$NFT_TABLE" "$fam" "$NFT_TABLE" "$masq" "$drop"
+}
+
+nft_apply() {
+    local rules
+    rules="$(nft_table ip "$SUBNET" "$(egress 4)" "$1")"
+    if [[ -n "$SUBNET6" ]]; then rules+=$'\n'"$(nft_table ip6 "$SUBNET6" "$(egress 6)" "$1")"; fi
     if [[ "$DRY" == 1 ]]; then
         printf '+ nft -f - <<EOF\n%s\nEOF\n' "$rules"
     else
         nft -f - <<<"$rules"
     fi
 }
-nft_remove() { try nft delete table ip "$NFT_TABLE"; }
+nft_remove() {
+    try nft delete table ip "$NFT_TABLE"
+    try nft delete table ip6 "$NFT_TABLE"
+}
 
 fw_apply() { if [[ "$(fw_backend)" == iptables ]]; then ipt_apply "$1"; else nft_apply "$1"; fi; }
 fw_remove() { if [[ "$(fw_backend)" == iptables ]]; then ipt_remove; else nft_remove; fi; }
@@ -291,6 +512,7 @@ fw_remove() { if [[ "$(fw_backend)" == iptables ]]; then ipt_remove; else nft_re
 check_rp_filter() {
     local all dev
     [[ "$DRY" == 1 ]] && return 0
+    [[ "$(egress 4)" == 1 ]] || return 0
     all="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo 0)"
     dev="$(sysctl -n "net.ipv4.conf.${OUTWAY//./\/}.rp_filter" 2>/dev/null || echo 0)"
     if ((all == 1 || dev == 1)); then
@@ -302,58 +524,91 @@ check_rp_filter() {
 
 cmd_up() {
     load_state
+    if [[ -n "$SUBNET6" ]]; then
+        ensure_v6_forwarding
+    else
+        remove_v6_forwarding
+        purge_stale_v6
+    fi
     apply_routes up
     fw_apply up
     check_rp_filter
-    note "outway $OUTWAY applied for $SUBNET (table $TABLE, $(fw_backend)): $ROUTE_STATE"
+    note "outway $OUTWAY ($(fams_name "$FAMILIES")) applied for $SUBNET${SUBNET6:+ and $SUBNET6} (table $TABLE, $(fw_backend)): IPv4 ${ROUTE_STATE_4}${SUBNET6:+, IPv6 ${ROUTE_STATE_6}}"
 }
 
 cmd_block() {
     load_state
     apply_routes block
     fw_apply block
-    note "telemt traffic from $SUBNET is blocked (fail-closed)"
+    note "telemt traffic from $SUBNET${SUBNET6:+ and $SUBNET6} is blocked (fail-closed)"
 }
 
 cmd_down() {
     load_state
     fw_remove
     remove_routes
-    note "outway rules for $SUBNET removed"
+    remove_v6_forwarding
+    note "outway rules for $SUBNET${SUBNET6:+ and $SUBNET6} removed"
+}
+
+# status_family FAMILY SUBNET: prints the rule/route lines of one family; sets ST.
+status_family() {
+    local f=$1 subnet=$2 route
+    if rule_present "$f" "$subnet"; then
+        printf 'ip rule    : IPv%s present\n' "$f"
+    else
+        printf 'ip rule    : IPv%s MISSING (telemt traffic is NOT policy-routed)\n' "$f"
+        ST=bad
+    fi
+    route="$(ip "-$f" route show table "$TABLE" 2>/dev/null || true)"
+    printf 'table %s (IPv%s):\n' "$TABLE" "$f"
+    # shellcheck disable=SC2001
+    [[ -z "$route" ]] || sed 's/^/    /' <<<"$route"
+    if [[ "$(egress "$f")" != 1 ]]; then
+        printf 'state      : IPv%s is not carried by %s: telemt IPv%s traffic is dropped (fail-closed)\n' "$f" "$OUTWAY" "$f"
+    elif ! grep -Eq "^default .*dev ${OUTWAY//./\\.}( |\$)" <<<"$route"; then
+        printf 'state      : IPv%s BLOCKED (fail-closed): no route via %s, telemt traffic is dropped\n' "$f" "$OUTWAY"
+        [[ "$ST" != ok ]] || ST=blocked
+    fi
 }
 
 cmd_status() {
-    local st=ok route
+    local fw
+    ST=ok
     load_state
-    printf 'outway     : %s (%s)\n' "$OUTWAY" "$(if iface_exists "$OUTWAY"; then iface_up "$OUTWAY" && echo up || echo DOWN; else echo MISSING; fi)"
-    printf 'subnet     : %s, table %s, rule priority %s, firewall %s\n' "$SUBNET" "$TABLE" "$PRIO" "$(fw_backend)"
-    if ip rule show | grep -Eq "from ${SUBNET//./\\.} lookup ${TABLE}\$"; then
-        printf 'ip rule    : present\n'
+    fw="$(fw_backend)"
+    printf 'outway     : %s (%s), carries %s\n' "$OUTWAY" "$(if iface_exists "$OUTWAY"; then iface_up "$OUTWAY" && echo up || echo DOWN; else echo MISSING; fi)" "$(fams_name "$FAMILIES")"
+    printf 'subnet     : %s%s, table %s, rule priority %s, firewall %s\n' "$SUBNET" "${SUBNET6:+, $SUBNET6}" "$TABLE" "$PRIO" "$fw"
+    status_family 4 "$SUBNET"
+    if [[ -n "$SUBNET6" ]]; then status_family 6 "$SUBNET6"; fi
+    if [[ "$fw" == iptables ]]; then
+        iptables -t filter -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : filter chain %s MISSING\n' "$CHAIN"; ST=bad; }
+        iptables -t nat -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : nat chain %s MISSING\n' "$CHAIN"; ST=bad; }
+        if [[ -n "$SUBNET6" ]]; then
+            ip6tables -t filter -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : ip6tables filter chain %s MISSING\n' "$CHAIN"; ST=bad; }
+            ip6tables -t nat -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : ip6tables nat chain %s MISSING\n' "$CHAIN"; ST=bad; }
+        fi
     else
-        printf 'ip rule    : MISSING (telemt traffic is NOT policy-routed)\n'
-        st=bad
+        nft list table ip "$NFT_TABLE" >/dev/null 2>&1 || { printf 'firewall   : nft table ip %s MISSING\n' "$NFT_TABLE"; ST=bad; }
+        if [[ -n "$SUBNET6" ]]; then
+            nft list table ip6 "$NFT_TABLE" >/dev/null 2>&1 || { printf 'firewall   : nft table ip6 %s MISSING\n' "$NFT_TABLE"; ST=bad; }
+        fi
     fi
-    route="$(ip -4 route show table "$TABLE" 2>/dev/null || true)"
-    printf 'table %s:\n' "$TABLE"
-    # shellcheck disable=SC2001
-    [[ -z "$route" ]] || sed 's/^/    /' <<<"$route"
-    if ! grep -Eq "^default .*dev ${OUTWAY//./\\.}( |\$)" <<<"$route"; then
-        printf 'state      : BLOCKED (fail-closed): no route via %s, telemt traffic is dropped\n' "$OUTWAY"
-        st=blocked
+    if [[ -n "$SUBNET6" ]]; then
+        if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == 1 ]]; then
+            printf 'sysctl     : net.ipv6.conf.all.forwarding = 1\n'
+        else
+            printf 'sysctl     : net.ipv6.conf.all.forwarding is NOT 1 (IPv6 of telemt is not forwarded)\n'
+            ST=bad
+        fi
     fi
-    if [[ "$(fw_backend)" == iptables ]]; then
-        iptables -t filter -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : filter chain %s MISSING\n' "$CHAIN"; st=bad; }
-        iptables -t nat -S "$CHAIN" >/dev/null 2>&1 || { printf 'firewall   : nat chain %s MISSING\n' "$CHAIN"; st=bad; }
-    else
-        nft list table ip "$NFT_TABLE" >/dev/null 2>&1 || { printf 'firewall   : nft table %s MISSING\n' "$NFT_TABLE"; st=bad; }
-    fi
-    [[ "$st" != ok ]] || printf 'state      : OK, telemt egress goes out through %s\n' "$OUTWAY"
+    [[ "$ST" != ok ]] || printf 'state      : OK, telemt egress goes out through %s (%s)\n' "$OUTWAY" "$(fams_name "$FAMILIES")"
     if systemctl is-enabled "$UNIT.service" >/dev/null 2>&1; then
         printf 'systemd    : %s.service enabled\n' "$UNIT"
     else
         printf 'systemd    : %s.service not enabled\n' "$UNIT"
     fi
-    [[ "$st" == ok ]]
+    [[ "$ST" == ok ]]
 }
 
 systemd_running() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
@@ -454,7 +709,7 @@ main() {
         esac
         shift
     done
-    [[ -n "$cmd" ]] || die "usage: $0 [--quiet] [--dry-run] up|block|down|status|list|check IF|install-unit|remove-unit"
+    [[ -n "$cmd" ]] || die "usage: $0 [--quiet] [--dry-run] up|block|down|status|list|names|resolve N|families IF|check IF|install-unit|remove-unit"
     if [[ "$DRY" != 1 ]]; then
         case "$cmd" in
             up | block | down | install-unit | remove-unit) ((EUID == 0)) || die "'$cmd' must run as root" ;;
@@ -466,6 +721,9 @@ main() {
         down) cmd_down ;;
         status) cmd_status ;;
         list) cmd_list ;;
+        names) iface_names ;;
+        resolve) cmd_resolve "${1:-}" ;;
+        families) cmd_families "${1:-}" ;;
         check) cmd_check "${1:-}" ;;
         install-unit) cmd_install_unit ;;
         remove-unit) cmd_remove_unit ;;

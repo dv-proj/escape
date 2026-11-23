@@ -3,10 +3,14 @@
 # defaults only, nothing runs at source time.
 # shellcheck shell=bash
 
-DATA_DIR="$APP_DIR/data"
-NGINX_DATA="$DATA_DIR/nginx"
-LE_DIR="$DATA_DIR/letsencrypt"
-EXT_COMPOSE_FILE="$DATA_DIR/extensions.compose.yml"
+# Directories and files derived from APP_DIR (the install directory). APP_DIR is
+# known only after the install directory has been chosen (ask_install_dir) or
+# found (resolve_app_dir), so init_paths fills these in at that point.
+DATA_DIR=""
+NGINX_DATA=""
+LE_DIR=""
+EXT_COMPOSE_FILE=""
+EXT_CERTS_FILE=""
 
 ASSUME_YES=0
 WITH_EXT=""
@@ -21,6 +25,16 @@ if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
 else
     C_RED="" C_GREEN="" C_YELLOW="" C_BOLD="" C_RESET=""
 fi
+
+# init_paths: derive every data path from APP_DIR (all runtime data lives in
+# $APP_DIR/data). Call it whenever APP_DIR is set or changed.
+init_paths() {
+    DATA_DIR="$APP_DIR/data"
+    NGINX_DATA="$DATA_DIR/nginx"
+    LE_DIR="$DATA_DIR/letsencrypt"
+    EXT_COMPOSE_FILE="$DATA_DIR/extensions.compose.yml"
+    EXT_CERTS_FILE="$NGINX_DATA/extra-certs.list"
+}
 
 info() { printf '    %s\n' "$*" >&2; }
 
@@ -68,7 +82,7 @@ finish_validation() {
 
 on_err() {
     local code=$? line=$1 cmd=$2 src="${BASH_SOURCE[1]:-install.sh}"
-    src="${src#"$APP_DIR"/}"
+    src="${src#"${APP_DIR:-$CODE_DIR}"/}"
     # ERR is inherited by subshells (set -E): report only in the main shell,
     # which fires again when the subshell fails.
     [[ "$BASHPID" == "$$" ]] || return "$code"
@@ -107,6 +121,7 @@ wait_for() {
 }
 
 require_root() {
+    [[ -z "${ESCAPE_TEST_SYNC_ONLY:-}" ]] || return 0
     ((EUID == 0)) || die "$(t common.need_root "$1" "$1")"
 }
 

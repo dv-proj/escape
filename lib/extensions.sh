@@ -9,11 +9,15 @@
 # Helpers for extension files (documented in extensions.d/README.md):
 #   ext_register_compose ID FILE / ext_unregister_compose ID
 #   ext_nginx_location_put ID (content on stdin) / ext_nginx_location_rm ID
+#   ext_nginx_server_put ID [CERT_NAME] (content on stdin) / ext_nginx_server_rm ID
+#   ext_cert_request ID NAME / ext_cert_release ID [--delete] / ext_cert_paths NAME (lib/certs.sh)
 #   ext_domain, ext_compose
 # Optional hooks per extension (install phases, see cmd_install): the functions
 # ext_<id>_collect (all questions; changes nothing) and ext_<id>_validate (read-only
-# checks, report with `problem`); <id> has "-" written as "_". The install
-# function registered here runs in the deploy phase and must not ask anything.
+# checks, report with `problem`) and ext_<id>_purge (`remove --purge`: delete what
+# the extension created outside the install directory); <id> has "-" written as
+# "_". The install function registered here runs in the deploy phase and must not
+# ask anything.
 
 EXT_IDS=()
 declare -A EXT_TITLE=() EXT_FN=()
@@ -120,6 +124,67 @@ ext_nginx_location_rm() {
     ok "$(t ext.location_removed "$id")"
 }
 
+# _ext_nginx_servers_ready: the base config includes servers.d and the running
+# nginx container has the directory mounted. An installation made before
+# servers.d existed is migrated here: the base config is rendered again and the
+# nginx container recreated with the current compose file (a short restart).
+_ext_nginx_servers_ready() {
+    mkdir -p "$NGINX_DATA/servers.d"
+    chmod a+rX "$NGINX_DATA/servers.d" 2>/dev/null || true
+    grep -qF '/etc/nginx/servers.d/' "$NGINX_DATA/conf.d/default.conf" 2>/dev/null || render_nginx_conf
+    stack_running nginx || return 0
+    compose exec -T nginx test -d /etc/nginx/servers.d >/dev/null 2>&1 && return 0
+    info "$(t ext.nginx_recreate)"
+    compose up -d --wait nginx </dev/null >&2
+}
+
+# ext_nginx_server_put ID [CERT_NAME]: read whole server blocks (http level) from
+# stdin into data/nginx/servers.d/<ID>.conf.in and render <ID>.conf from it. With
+# CERT_NAME, @SSL_CERT@ and @SSL_KEY@ are replaced by the certificate of that
+# name (Let's Encrypt when issued, else a temporary self-signed one; see
+# ext_cert_request), also on every later render (renew, start, restart). Then
+# the config is tested and nginx reloaded when it runs; a rejected config is
+# rolled back and the script stops with an error.
+ext_nginx_server_put() {
+    local id=${1:-} name=${2:-} dir="$NGINX_DATA/servers.d" src out tmp b_src="" b_out=""
+    ext_valid_id "$id" || die "$(t ext.bad_id ext_nginx_server_put "$id")"
+    [[ -z "$name" ]] || valid_domain "$name" || die "$(t certs.ext_bad_name ext_nginx_server_put "$name")"
+    src="$dir/$id.conf.in"
+    out="$dir/$id.conf"
+    mkdir -p "$dir"
+    tmp="$(mktemp "$src.XXXXXX")"
+    {
+        [[ -z "$name" ]] || printf '# cert-domain: %s\n' "${name,,}"
+        cat
+    } >"$tmp"
+    grep -qv '^# cert-domain: ' "$tmp" || { rm -f "$tmp"; die "$(t ext.empty_server ext_nginx_server_put "$id")"; }
+    chmod 644 "$tmp"
+    _ext_nginx_servers_ready </dev/null
+    if [[ -f "$src" ]]; then b_src="$(mktemp "$src.bak.XXXXXX")" && cp -p "$src" "$b_src"; fi
+    if [[ -f "$out" ]]; then b_out="$(mktemp "$out.bak.XXXXXX")" && cp -p "$out" "$b_out"; fi
+    mv -f "$tmp" "$src"
+    render_ext_servers
+    if ext_nginx_apply; then
+        [[ -z "$b_src" ]] || rm -f "$b_src"
+        [[ -z "$b_out" ]] || rm -f "$b_out"
+        ok "$(t ext.server_ok "$id" "$out")"
+        return 0
+    fi
+    if [[ -n "$b_src" ]]; then mv -f "$b_src" "$src"; else rm -f "$src"; fi
+    if [[ -n "$b_out" ]]; then mv -f "$b_out" "$out"; else rm -f "$out"; fi
+    die "$(t ext.nginx_rejected_server "$id")"
+}
+
+# ext_nginx_server_rm ID: delete data/nginx/servers.d/<ID>.conf(.in) and reload.
+ext_nginx_server_rm() {
+    local id=${1:-}
+    ext_valid_id "$id" || die "$(t ext.bad_id ext_nginx_server_rm "$id")"
+    [[ -e "$NGINX_DATA/servers.d/$id.conf" || -e "$NGINX_DATA/servers.d/$id.conf.in" ]] || return 0
+    rm -f "$NGINX_DATA/servers.d/$id.conf" "$NGINX_DATA/servers.d/$id.conf.in"
+    ext_nginx_apply || warn "$(t ext.nginx_after_rm "$id")"
+    ok "$(t ext.server_removed "$id")"
+}
+
 # ext_nginx_apply: `nginx -t` and reload when the nginx container runs (else
 # the files are picked up at its next start). Fails when the test fails.
 ext_nginx_apply() {
@@ -141,7 +206,7 @@ register_extension() {
 
 load_extensions() {
     local f
-    for f in "$APP_DIR"/extensions.d/*.sh; do
+    for f in "$CODE_DIR"/extensions.d/*.sh; do
         [[ -f "$f" ]] || continue
         # shellcheck disable=SC1090
         source "$f"

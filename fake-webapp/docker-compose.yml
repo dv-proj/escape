@@ -23,8 +23,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "${LOG_MAX_SIZE:-5m}"
+        max-file: "${LOG_MAX_FILE:-3}"
     environment:
       # Listen port inside the container (FAKEAPP_PORT).
       LISTEN_ADDR: ":${FAKEAPP_PORT:-8080}"

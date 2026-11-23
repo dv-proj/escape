@@ -55,3 +55,7 @@ server {
         proxy_read_timeout 60s;
     }
 }
+
+# Extensions with their own names: one .conf file each (whole server blocks,
+# rendered from data/nginx/servers.d/<id>.conf.in), see extensions.d/README.md.
+include /etc/nginx/servers.d/*.conf;

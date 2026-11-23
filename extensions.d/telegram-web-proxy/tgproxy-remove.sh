@@ -7,11 +7,14 @@
 #
 #   tgproxy-remove.sh [--yes] [--purge]
 #
-# Removes, in this order: the nginx location (reload), the telemt container, its
-# network and image, the outway rules and systemd units, the entry in
-# data/extensions.compose.yml. Without --purge data/telegram-web-proxy/ (state,
-# config with the secrets, saved image) is kept, so a reinstall restores the same
-# link; --purge deletes it and the standalone scripts of this directory.
+# Removes, in this order: the nginx location or the server blocks of the separate
+# proxy name (reload) and the registration of its certificate (no more renewals),
+# the telemt container, its network and image, the outway rules (IPv4 and IPv6),
+# the sysctl.d file and systemd units, the entry in data/extensions.compose.yml.
+# Without --purge data/telegram-web-proxy/ (state, config with the secrets, saved
+# image) and the certificate of the proxy name are kept, so a reinstall restores
+# the same link; --purge deletes them and the standalone scripts of this
+# directory. The certificate of the site (DOMAIN) is never touched.
 #
 # Environment: TGPROXY_STATE (state file), TGPROXY_DRY_RUN=1 (outway commands are
 # only printed).
@@ -98,13 +101,16 @@ NET_NAME="$(state_get NET_NAME)"
 IMAGE="$(state_get TELEMT_IMAGE)"
 PROJECT="$(state_get COMPOSE_PROJECT)"
 SCRIPTS_DIR="$(state_get SCRIPTS_DIR)"
-PROJECT="${PROJECT:-fakeapp}"
-[[ -d "$APP_DIR" && -f "$APP_DIR/docker-compose.yml" ]] || die "APP_DIR '$APP_DIR' from the state file is not a fakeapp project"
+DOMAIN="$(state_get DOMAIN)"
+PROXY_NAME="$(state_get TGPROXY_DOMAIN)"
+PROJECT="${PROJECT:-escape}"
+[[ -d "$APP_DIR" && -f "$APP_DIR/docker-compose.yml" ]] || die "APP_DIR '$APP_DIR' from the state file is not an escape project"
 
 if ((!YES)); then
     [[ -t 0 ]] || die "no terminal: pass --yes to confirm"
-    what="container, image, outway rules, nginx location"
+    what="container, image, outway rules, nginx route"
     ((!PURGE)) || what+=", config and secrets"
+    ((!PURGE)) || [[ -z "$PROXY_NAME" || "$PROXY_NAME" == "$DOMAIN" ]] || what+=", certificate of $PROXY_NAME"
     read -r -p "Remove the Telegram web proxy ($what)? [y/N] " ans || die "no input"
     [[ "${ans,,}" == y || "${ans,,}" == yes ]] || die "aborted"
 fi
@@ -113,13 +119,39 @@ have_docker=0
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && have_docker=1
 ((have_docker)) || warn "docker is not available: skipping the container, network and image"
 
-say "==> nginx location"
-rm -f "${APP_DIR:?}/data/nginx/locations.d/${LOC_ID:?}.conf"
+say "==> nginx route"
+NGX="${APP_DIR:?}/data/nginx"
+rm -f "$NGX/locations.d/${LOC_ID:?}.conf" "$NGX/servers.d/${LOC_ID:?}.conf" "$NGX/servers.d/${LOC_ID:?}.conf.in"
 if ((have_docker)) && [[ -n "$(compose ps -q nginx 2>/dev/null | head -n1)" ]]; then
     if compose exec -T nginx nginx -t >/dev/null 2>&1; then
         compose exec -T nginx nginx -s reload >/dev/null 2>&1 && info "nginx reloaded: the secret path now goes to the decoy site"
     else
-        warn "nginx -t fails after removing the location: $(compose exec -T nginx nginx -t 2>&1 | tail -n1)"
+        warn "nginx -t fails after removing the route: $(compose exec -T nginx nginx -t 2>&1 | tail -n1)"
+    fi
+fi
+
+# The certificate registration of data/nginx/extra-certs.list (format of install.sh
+# ext_cert_request): the entry of this extension goes away, the others stay.
+if [[ -f "$NGX/extra-certs.list" ]]; then
+    tmp="$(mktemp "$NGX/extra-certs.list.XXXXXX")"
+    { grep -v "^$LOC_ID " "$NGX/extra-certs.list" || true; } >"$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$NGX/extra-certs.list"
+    info "certificate registration of '$LOC_ID' removed (no more renewals)"
+fi
+if ((PURGE)) && [[ -n "$PROXY_NAME" && "$PROXY_NAME" != "$DOMAIN" ]] && [[ "$PROXY_NAME" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    say "==> certificate of $PROXY_NAME"
+    LE="$APP_DIR/data/letsencrypt"
+    if ! grep -q " $PROXY_NAME\$" "$NGX/extra-certs.list" 2>/dev/null; then
+        if [[ -d "$LE/live/$PROXY_NAME" || -f "$LE/renewal/$PROXY_NAME.conf" ]]; then
+            if ! { ((have_docker)) && compose run --rm -T certbot delete --cert-name "$PROXY_NAME" --non-interactive >/dev/null 2>&1; }; then
+                rm -rf "${LE:?}/live/$PROXY_NAME" "${LE:?}/archive/$PROXY_NAME" "${LE:?}/renewal/$PROXY_NAME.conf"
+            fi
+        fi
+        rm -rf "${NGX:?}/selfsigned/$PROXY_NAME"
+        info "deleted the certificate files of $PROXY_NAME"
+    else
+        info "the certificate of $PROXY_NAME is registered by another extension: kept"
     fi
 fi
 
@@ -139,7 +171,7 @@ if [[ -x "$OUTWAY_SH" ]]; then
     "$OUTWAY_SH" remove-unit || warn "removing the systemd units failed"
     "$OUTWAY_SH" down || warn "removing the outway rules failed"
 else
-    warn "$OUTWAY_SH not found: remove the ip rule, table, TGPROXY-OUTWAY chains and the telegram-web-proxy-outway units by hand"
+    warn "$OUTWAY_SH not found: remove the ip and ip -6 rules, the routing table, the TGPROXY-OUTWAY chains (iptables and ip6tables), /etc/sysctl.d/90-telegram-web-proxy.conf and the telegram-web-proxy-outway units by hand"
 fi
 
 say "==> compose registration"
@@ -153,8 +185,8 @@ if ((PURGE)); then
     rm -rf "${TG_DIR:?}"
     info "deleted $TG_DIR"
     # The installed copies (not the ones of the repository) go away too.
-    if [[ -n "$SCRIPTS_DIR" && -d "$SCRIPTS_DIR" && "$SCRIPTS_DIR" != "$APP_DIR"/* ]] &&
-        [[ "$SCRIPTS_DIR" == */telegram-web-proxy || "$SCRIPTS_DIR" == /opt/fakeapp-tgproxy ]]; then
+    if [[ -n "$SCRIPTS_DIR" && -d "$SCRIPTS_DIR" ]] &&
+        [[ "$SCRIPTS_DIR" == "$APP_DIR/scripts" || "$SCRIPTS_DIR" == */telegram-web-proxy ]]; then
         rm -f "${SCRIPTS_DIR:?}/tgproxy-remove.sh" "${SCRIPTS_DIR:?}/tgproxy-config.sh" "${SCRIPTS_DIR:?}/tgproxy-outway.sh"
         rmdir "$SCRIPTS_DIR" 2>/dev/null || true
         info "deleted the scripts in $SCRIPTS_DIR"

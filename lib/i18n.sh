@@ -2,6 +2,10 @@
 # Sourced by install.sh (see the source list there), first of the modules.
 # shellcheck shell=bash
 #
+# Message files are read from CODE_DIR (the directory of the running install.sh:
+# the source checkout / download before the project is copied to the install
+# directory, the install directory itself afterwards).
+#
 # Design: every user-facing text is a printf format in the associative array
 # MSG, filled by lib/lang/en.sh and (for the other language) lib/lang/ru.sh.
 # English is always loaded first and the chosen language is loaded over it, so
@@ -51,9 +55,9 @@ set_language() {
     local id
     FAKEAPP_LANG_ACTIVE=$1
     MSG=()
-    _i18n_source_dir "$APP_DIR/lib/lang"
+    _i18n_source_dir "$CODE_DIR/lib/lang"
     for id in "${I18N_EXT_LOADED[@]}"; do
-        _i18n_source_dir "$APP_DIR/extensions.d/$id/lang"
+        _i18n_source_dir "$CODE_DIR/extensions.d/$id/lang"
     done
 }
 
@@ -66,7 +70,7 @@ ext_load_lang() {
         [[ "$l" != "$id" ]] || have=1
     done
     ((have)) || I18N_EXT_LOADED+=("$id")
-    _i18n_source_dir "$APP_DIR/extensions.d/$id/lang"
+    _i18n_source_dir "$CODE_DIR/extensions.d/$id/lang"
 }
 
 # ext_title ID: the menu title of an extension: the message "<ID>.title" of its
@@ -81,7 +85,8 @@ ext_title() {
 }
 
 # i18n_init: resolve the language without asking: --lang, then the
-# FAKEAPP_LANG environment variable, then FAKEAPP_LANG in .env. An unknown
+# FAKEAPP_LANG environment variable, then FAKEAPP_LANG in the .env of the
+# installation that is found (install_dir_hint; none: not read). An unknown
 # value is remembered (LANG_INVALID) and English is used until validation.
 i18n_init() {
     local v="" src=""
@@ -89,9 +94,12 @@ i18n_init() {
         v=$LANG_FLAG src="--lang"
     elif [[ -n "${FAKEAPP_LANG:-}" ]]; then
         v=$FAKEAPP_LANG src="FAKEAPP_LANG"
-    elif [[ -f "$APP_DIR/.env" ]]; then
-        v="$(env_get "$APP_DIR/.env" FAKEAPP_LANG)"
-        src=".env"
+    else
+        install_dir_hint
+        if [[ -n "$DIR_HINT" && -f "$DIR_HINT/.env" ]]; then
+            v="$(env_get "$DIR_HINT/.env" FAKEAPP_LANG)"
+            src=".env"
+        fi
     fi
     v="${v,,}"
     LANG_SRC=""
