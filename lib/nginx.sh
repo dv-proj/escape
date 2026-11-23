@@ -2,9 +2,18 @@
 # data/nginx/servers.d/ holds whole server blocks of extensions (their own
 # names, see ext_nginx_server_put): <id>.conf.in is the source written by the
 # extension, <id>.conf the rendered file nginx includes at http level.
+# data/nginx/stream.d/ holds the SNI routes (<id>.map) and upstreams (<id>.conf)
+# of the TLS front (stream block, see ext_nginx_stream_put).
+#
+# Ports: the host HTTPS port (NGINX_HTTPS_PORT) is published to the TLS front
+# (container port NGINX_FRONT_PORT, conf.d/front.stream); the HTTPS server
+# listens on container port 443 with the PROXY protocol and is not published.
 # Sourced by install.sh (see the source list there): functions and variable
 # defaults only, nothing runs at source time.
 # shellcheck shell=bash
+
+# Container port of the TLS front (stream); nginx/docker-compose.yml publishes it.
+NGINX_FRONT_PORT=4443
 
 # port_in_use PORT: something listens on TCP PORT of the host (any address).
 port_in_use() {
@@ -111,6 +120,24 @@ render_nginx_conf() {
     printf '%s\n' "$content" >"$tmp"
     chmod 644 "$tmp"
     mv -f "$tmp" "$out"
+    # The default call (no TEMPLATE) renders the TLS front (stream block) next to it.
+    [[ -n "${1:-}" ]] || render_stream_conf
+}
+
+# render_stream_conf [TEMPLATE OUT]: fill nginx/stream.conf.template (default
+# OUT: data/nginx/conf.d/front.stream, included by the stream block of nginx.conf).
+render_stream_conf() {
+    local tpl="${1:-$APP_DIR/nginx/stream.conf.template}"
+    local out="${2:-$NGINX_DATA/conf.d/front.stream}"
+    local content tmp
+    [[ -f "$tpl" ]] || die "$(t env.no_template "$tpl")"
+    content="$(<"$tpl")"
+    content="${content//@FRONT_PORT@/$NGINX_FRONT_PORT}"
+    mkdir -p "$(dirname "$out")" "$NGINX_DATA/stream.d"
+    tmp="$(mktemp "$out.XXXXXX")"
+    printf '%s\n' "$content" >"$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$out"
 }
 
 # render_ext_servers: render every data/nginx/servers.d/<id>.conf.in into
@@ -137,24 +164,41 @@ render_ext_servers() {
     done
 }
 
-# prepare_nginx_dir: data/nginx/{conf.d,locations.d,servers.d,webroot,selfsigned},
-# the temporary certificate and the rendered configs (base and servers.d).
+# prepare_nginx_dir: data/nginx/{conf.d,locations.d,servers.d,stream.d,webroot,selfsigned},
+# the temporary certificate and the rendered configs (base, TLS front, servers.d).
 prepare_nginx_dir() {
     local d owner
     owner="$(project_owner)"
-    mkdir -p "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot" "$NGINX_DATA/selfsigned" "$LE_DIR"
+    mkdir -p "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/stream.d" "$NGINX_DATA/webroot" "$NGINX_DATA/selfsigned" "$LE_DIR"
     ensure_selfsigned "$(site_domain)"
     render_nginx_conf
     render_ext_servers
-    chmod -R a+rX "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot"
-    for d in "$DATA_DIR" "$NGINX_DATA" "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/webroot"; do
+    chmod -R a+rX "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/stream.d" "$NGINX_DATA/webroot"
+    for d in "$DATA_DIR" "$NGINX_DATA" "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/servers.d" "$NGINX_DATA/stream.d" "$NGINX_DATA/webroot"; do
         chown "$owner" "$d" 2>/dev/null || true
     done
     ok "$(t nginx.rendered "$NGINX_DATA/conf.d/default.conf" "$(have_le_cert "$(site_domain)" && t nginx.cert_le || t nginx.cert_self)")"
 }
 
+# nginx_front_ready: the running nginx container has the TLS front (the main
+# config with the stream block and data/nginx/stream.d mounted). A container
+# created before the front existed publishes the HTTPS server directly, which no
+# longer works with the PROXY protocol listener of the rendered config: it is
+# recreated once with the current compose file (a few seconds without the site).
+# Nothing to do when nginx is not running (its next start uses the new files).
+nginx_front_ready() {
+    stack_running nginx || return 0
+    compose exec -T nginx sh -c 'test -d /etc/nginx/stream.d && grep -qF "conf.d/*.stream" /etc/nginx/nginx.conf' >/dev/null 2>&1 && return 0
+    [[ -f "$NGINX_DATA/conf.d/front.stream" ]] || render_nginx_conf
+    mkdir -p "$NGINX_DATA/stream.d"
+    chmod a+rX "$NGINX_DATA/stream.d" 2>/dev/null || true
+    info "$(t nginx.recreate_front)"
+    compose up -d --wait nginx </dev/null >&2
+}
+
 # nginx_reload: test the config in the running container and reload it.
 nginx_reload() {
+    nginx_front_ready || return 1
     compose exec -T nginx nginx -t >/dev/null 2>&1 || {
         compose exec -T nginx nginx -t >&2 || true
         return 1

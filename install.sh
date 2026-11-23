@@ -9,9 +9,11 @@
 # is available (the system Docker is reused, Docker CE is installed only when
 # there is none), generates .env, the decoy page and the nginx config, starts
 # the stack, issues the certificate (certbot, webroot) and installs a renewal
-# timer. nginx publishes ports 80 and 443 of the host; the app itself is
-# reachable only inside the compose network. It never touches Xray, 3X-UI or
-# the firewall.
+# timer. nginx publishes ports 80 and 443 of the host (443: a TLS front that
+# routes by SNI, the HTTPS server behind it gets the client address with the
+# PROXY protocol); the app itself is reachable only inside the compose network.
+# The base never touches Xray, 3X-UI or the firewall (optional extensions in
+# extensions.d/ may, see their files).
 #
 # This file is the entry point: it only bootstraps the project and sources the
 # modules from lib/ (i18n, common, instdir, gen, env, system, nginx, certs, app,

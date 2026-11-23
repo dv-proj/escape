@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # tgproxy-outway.sh - outgoing-interface ("outway") policy routing for the
-# TELEMT container of the telegram-web-proxy extension.
+# container of an extension: TELEMT of telegram-web-proxy (this file), and,
+# installed as a renamed copy (xray-outway.sh), 3x-ui of xray-3xui.
 #
 # Self-contained: needs bash, iproute2 and iptables (or nft); no repository,
-# no network. Reads data/telegram-web-proxy/state.env. Only traffic whose source
-# is the dedicated subnet of the telemt container is affected; other containers
-# and the host keep their routes.
+# no network. Reads the state file of the extension (data/telegram-web-proxy/
+# state.env here). Only traffic whose source is the dedicated subnet of the
+# container is affected; other containers and the host keep their routes.
+#
+# Everything it creates is named by the state file, so that several extensions
+# can each have their own outway side by side (defaults: the telemt names, which
+# older state files rely on):
+#   ROUTE_TABLE / RULE_PRIO (7791)      OUTWAY_CHAIN (TGPROXY-OUTWAY, iptables chains)
+#   OUTWAY_NFT_TABLE (tgproxy_outway)   OUTWAY_UNIT (telegram-web-proxy-outway, systemd)
+#   OUTWAY_SYSCTL_NAME (90-telegram-web-proxy.conf)  OUTWAY_COMMENT (tgproxy-outway)
+#   OUTWAY_LABEL (telemt, in messages)  OUTWAY_TITLE (Telegram web proxy, unit descriptions)
 #
 #   up         apply: routing table + ip rule + NAT + fail-closed firewall rules,
 #              per address family (IPv4, IPv6 or both; see OUTWAY_FAMILIES below)
 #   block      keep the rules and the DROP, remove the way out (fail-closed stop)
 #   down       remove everything this script created (the routes, rules, chains,
 #              the sysctl.d file)
-#   status     show what is applied and whether telemt traffic is blocked
+#   status     show what is applied and whether the container traffic is blocked
 #   list       numbered list of the candidate outgoing interfaces
 #   names      the candidate interface names, one per line (same order as `list`)
 #   resolve X  interface number (from `list`) or name -> name; exit 1 when invalid
@@ -22,7 +31,7 @@
 #
 # An outway may carry only IPv4, only IPv6 or both (a tunnel may have no IPv4 at
 # all). The family set is detected from the global-scope addresses and the routes
-# of the interface and stored as OUTWAY_FAMILIES in the state file. The telemt
+# of the interface and stored as OUTWAY_FAMILIES in the state file. The
 # container network has a ULA IPv6 subnet (NET_SUBNET6) when IPv6 is used. A
 # family the outway does not carry is blocked for the container (fail closed).
 #
@@ -41,11 +50,16 @@ if [[ "$STATE_FILE" == "@STATE_FILE@" ]]; then
 fi
 DRY="${TGPROXY_DRY_RUN:-0}"
 QUIET=0
+# Names (see the header); load_names replaces them with the values of the state file.
 CHAIN="TGPROXY-OUTWAY"
 NFT_TABLE="tgproxy_outway"
 UNIT="telegram-web-proxy-outway"
 UNIT_DIR="${TGPROXY_UNIT_DIR:-/etc/systemd/system}"
-SYSCTL_FILE="${TGPROXY_SYSCTL_DIR:-/etc/sysctl.d}/90-telegram-web-proxy.conf"
+SYSCTL_DIR="${TGPROXY_SYSCTL_DIR:-/etc/sysctl.d}"
+SYSCTL_FILE="$SYSCTL_DIR/90-telegram-web-proxy.conf"
+COMMENT="tgproxy-outway"
+LABEL="telemt"
+TITLE="Telegram web proxy"
 ROUTE_STATE_4="" ROUTE_STATE_6=""
 WARNED_DOWN=0
 
@@ -71,6 +85,47 @@ try() { run "$@" 2>/dev/null || true; }
 state_get() {
     [[ -f "$STATE_FILE" ]] || return 0
     sed -n "s/^$1=//p" "$STATE_FILE" | tail -n1
+}
+
+# load_names: the names of the state file (when it exists), validated.
+load_names() {
+    local v
+    [[ -f "$STATE_FILE" ]] || return 0
+    v="$(state_get OUTWAY_CHAIN)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[A-Z][A-Z0-9_-]{0,23}$ ]] || die "OUTWAY_CHAIN invalid in $STATE_FILE"
+        CHAIN="$v"
+    fi
+    v="$(state_get OUTWAY_NFT_TABLE)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[a-z][a-z0-9_]{0,31}$ ]] || die "OUTWAY_NFT_TABLE invalid in $STATE_FILE"
+        NFT_TABLE="$v"
+    fi
+    v="$(state_get OUTWAY_UNIT)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || die "OUTWAY_UNIT invalid in $STATE_FILE"
+        UNIT="$v"
+    fi
+    v="$(state_get OUTWAY_SYSCTL_NAME)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[0-9]{2}-[a-z0-9-]+\.conf$ ]] || die "OUTWAY_SYSCTL_NAME invalid in $STATE_FILE"
+        SYSCTL_FILE="$SYSCTL_DIR/$v"
+    fi
+    v="$(state_get OUTWAY_COMMENT)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || die "OUTWAY_COMMENT invalid in $STATE_FILE"
+        COMMENT="$v"
+    fi
+    v="$(state_get OUTWAY_LABEL)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || die "OUTWAY_LABEL invalid in $STATE_FILE"
+        LABEL="$v"
+    fi
+    v="$(state_get OUTWAY_TITLE)"
+    if [[ -n "$v" ]]; then
+        [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._()+-]{0,63}$ ]] || die "OUTWAY_TITLE invalid in $STATE_FILE"
+        TITLE="$v"
+    fi
 }
 
 valid_iface() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]]; }
@@ -294,16 +349,27 @@ apply_routes_family() {
             st="down"
             if ((!WARNED_DOWN)); then
                 WARNED_DOWN=1
-                warn "outway '$OUTWAY' is down or missing: telemt traffic is blocked (fail-closed) until it is back"
+                warn "outway '$OUTWAY' is down or missing: $LABEL traffic is blocked (fail-closed) until it is back"
             fi
         fi
     fi
     if [[ "$DRY" == 1 ]]; then
         printf '+ ip -%s rule add from %s lookup %s priority %s   # skipped when already present\n' "$f" "$subnet" "$TABLE" "$PRIO"
     elif ! rule_present "$f" "$subnet"; then
+        # A rule of an older setting (e.g. with iif) goes first.
+        while ip "-$f" rule del from "$subnet" lookup "$TABLE" priority "$PRIO" 2>/dev/null; do :; done
         ip "-$f" rule add from "$subnet" lookup "$TABLE" priority "$PRIO"
     fi
     if [[ "$f" == 4 ]]; then ROUTE_STATE_4="$st"; else ROUTE_STATE_6="$st"; fi
+}
+
+# purge_legacy_reply FAMILY SUBNET: the fwmark rule that an earlier version added for
+# a published port ("from SUBNET fwmark MARK lookup main" at RULE_PRIO - 100).
+purge_legacy_reply() {
+    local prio=$((PRIO > 100 ? PRIO - 100 : 1))
+    [[ "$DRY" != 1 && -n "$2" ]] || return 0
+    ip "-$1" rule show 2>/dev/null | grep -Eq "^${prio}:[[:space:]]+from ${2//./\\.} fwmark .* lookup main" || return 0
+    while ip "-$1" rule del priority "$prio" lookup main 2>/dev/null; do :; done
 }
 
 # apply_routes MODE: up = default via the outway, block = unreachable only.
@@ -324,6 +390,7 @@ remove_routes() {
                 while ip "-$f" rule del from "$subnet" lookup "$TABLE" priority "$PRIO" 2>/dev/null; do :; done
             fi
         fi
+        purge_legacy_reply "$f" "$subnet"
         try ip "-$f" route flush table "$TABLE"
     done
 }
@@ -345,8 +412,8 @@ ensure_v6_forwarding() {
                 [[ "$cur" != 1 ]] || ra+="net.ipv6.conf.${ifc//./\/}.accept_ra = 2"$'\n'
             done < <(ip -6 route show default 2>/dev/null | awk '/proto ra/ {for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u)
         fi
-        content="# Generated by tgproxy-outway.sh (telegram-web-proxy): IPv6 forwarding for the telemt container.
-# Removed by tgproxy-remove.sh.
+        content="# Generated by $(basename "$SELF") ($TITLE): IPv6 forwarding for the $LABEL container.
+# Removed by the remove script of the extension.
 ${ra}net.ipv6.conf.all.forwarding = 1"
         if [[ "$DRY" == 1 ]]; then
             printf '+ write %s:\n%s\n' "$SYSCTL_FILE" "$(sed 's/^/+   /' <<<"$content")"
@@ -361,8 +428,15 @@ ${ra}net.ipv6.conf.all.forwarding = 1"
         fi
     fi
     if ! sysctl -q -p "$SYSCTL_FILE" >/dev/null 2>&1 || [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" != 1 ]]; then
-        warn "cannot set net.ipv6.conf.all.forwarding=1: IPv6 traffic of telemt will not be forwarded (run: sysctl -w net.ipv6.conf.all.forwarding=1)"
+        warn "cannot set net.ipv6.conf.all.forwarding=1: IPv6 traffic of $LABEL will not be forwarded (run: sysctl -w net.ipv6.conf.all.forwarding=1)"
     fi
+}
+
+# remove_src_valid_mark: the sysctl.d file of an earlier version (published port).
+remove_src_valid_mark() {
+    local f="${SYSCTL_FILE%.conf}-srcmark.conf"
+    [[ -e "$f" ]] || return 0
+    run rm -f "$f"
 }
 
 remove_v6_forwarding() {
@@ -410,16 +484,16 @@ ipt_apply_family() {
     try "$bin" -t nat -N "$CHAIN"
     run "$bin" -t nat -F "$CHAIN"
     if [[ "$eg" == 1 ]]; then
-        run "$bin" -t nat -A "$CHAIN" -s "$subnet" -o "$OUTWAY" -m comment --comment tgproxy-outway -j MASQUERADE
+        run "$bin" -t nat -A "$CHAIN" -s "$subnet" -o "$OUTWAY" -m comment --comment "$COMMENT" -j MASQUERADE
     fi
     ipt_ensure_jump "$bin" nat POSTROUTING -s "$subnet"
     # filter: nothing from the subnet may leave through any other interface
     try "$bin" -t filter -N "$CHAIN"
     run "$bin" -t filter -F "$CHAIN"
     if [[ "$mode" == up && "$eg" == 1 ]]; then
-        run "$bin" -t filter -A "$CHAIN" -s "$subnet" ! -o "$OUTWAY" -m comment --comment tgproxy-outway -j DROP
+        run "$bin" -t filter -A "$CHAIN" -s "$subnet" ! -o "$OUTWAY" -m comment --comment "$COMMENT" -j DROP
     else
-        run "$bin" -t filter -A "$CHAIN" -s "$subnet" -m comment --comment tgproxy-outway -j DROP
+        run "$bin" -t filter -A "$CHAIN" -s "$subnet" -m comment --comment "$COMMENT" -j DROP
     fi
     ipt_ensure_jump "$bin" filter "$parent" -s "$subnet"
 }
@@ -447,11 +521,17 @@ ipt_remove_family() {
         command -v "$bin" >/dev/null 2>&1 || return 0
         for parent in DOCKER-USER FORWARD; do ipt_purge_jumps "$bin" filter "$parent"; done
         ipt_purge_jumps "$bin" nat POSTROUTING
+        # mangle chain of an earlier version (reply marks of a published port).
+        for parent in FORWARD PREROUTING; do ipt_purge_jumps "$bin" mangle "$parent"; done
     fi
     try "$bin" -t filter -F "$CHAIN"
     try "$bin" -t filter -X "$CHAIN"
     try "$bin" -t nat -F "$CHAIN"
     try "$bin" -t nat -X "$CHAIN"
+    if [[ "$DRY" != 1 ]]; then
+        try "$bin" -t mangle -F "$CHAIN"
+        try "$bin" -t mangle -X "$CHAIN"
+    fi
 }
 
 ipt_apply() {
@@ -471,6 +551,7 @@ purge_stale_v6() {
     ip -6 rule show 2>/dev/null | grep -q "^${PRIO}:" || return 0
     if [[ "$(fw_backend)" == iptables ]]; then ipt_remove_family ip6tables ""; else try nft delete table ip6 "$NFT_TABLE"; fi
     while ip -6 rule del priority "$PRIO" lookup "$TABLE" 2>/dev/null; do :; done
+    purge_legacy_reply 6 "$SUBNET6"
     ip -6 route flush table "$TABLE" 2>/dev/null || true
 }
 
@@ -480,12 +561,12 @@ purge_stale_v6() {
 nft_table() {
     local fam=$1 subnet=$2 eg=$3 mode=$4 drop masq=""
     if [[ "$mode" == up && "$eg" == 1 ]]; then
-        drop="$fam saddr $subnet oifname != \"$OUTWAY\" counter drop comment \"tgproxy-outway\""
+        drop="$fam saddr $subnet oifname != \"$OUTWAY\" counter drop comment \"$COMMENT\""
     else
-        drop="$fam saddr $subnet counter drop comment \"tgproxy-outway\""
+        drop="$fam saddr $subnet counter drop comment \"$COMMENT\""
     fi
-    [[ "$eg" != 1 ]] || masq="$fam saddr $subnet oifname \"$OUTWAY\" counter masquerade comment \"tgproxy-outway\""
-    printf 'add table %s %s\ndelete table %s %s\ntable %s %s {\n    chain post {\n        type nat hook postrouting priority srcnat; policy accept;\n        %s\n    }\n    chain fwd {\n        type filter hook forward priority -10; policy accept;\n        %s\n    }\n}\n' \
+    [[ "$eg" != 1 ]] || masq="$fam saddr $subnet oifname \"$OUTWAY\" counter masquerade comment \"$COMMENT\""
+    printf 'add table %s %s\ndelete table %s %s\ntable %s %s {\n    chain nat_post {\n        type nat hook postrouting priority srcnat; policy accept;\n        %s\n    }\n    chain filter_fwd {\n        type filter hook forward priority -10; policy accept;\n        %s\n    }\n}\n' \
         "$fam" "$NFT_TABLE" "$fam" "$NFT_TABLE" "$fam" "$NFT_TABLE" "$masq" "$drop"
 }
 
@@ -516,11 +597,30 @@ check_rp_filter() {
     all="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo 0)"
     dev="$(sysctl -n "net.ipv4.conf.${OUTWAY//./\/}.rp_filter" 2>/dev/null || echo 0)"
     if ((all == 1 || dev == 1)); then
-        warn "strict reverse-path filtering (rp_filter=1) may drop replies arriving on $OUTWAY; if telemt cannot connect, set net.ipv4.conf.all.rp_filter=2 and net.ipv4.conf.$OUTWAY.rp_filter=2"
+        warn "strict reverse-path filtering (rp_filter=1) may drop replies arriving on $OUTWAY; if $LABEL cannot connect, set net.ipv4.conf.all.rp_filter=2 and net.ipv4.conf.$OUTWAY.rp_filter=2"
     fi
 }
 
 # --- commands ---------------------------------------------------------------------------------
+
+# remove_legacy_reply: what an earlier version added for a published port (fwmark rule,
+# mangle chain, src_valid_mark sysctl.d file); nothing to do on a clean host.
+remove_legacy_reply() {
+    local bin
+    [[ "$DRY" != 1 ]] || return 0
+    remove_src_valid_mark
+    purge_legacy_reply 4 "$SUBNET"
+    purge_legacy_reply 6 "$SUBNET6"
+    [[ "$(fw_backend)" == iptables ]] || return 0
+    for bin in iptables ip6tables; do
+        command -v "$bin" >/dev/null 2>&1 || continue
+        "$bin" -t mangle -S "$CHAIN" >/dev/null 2>&1 || continue
+        ipt_purge_jumps "$bin" mangle FORWARD
+        ipt_purge_jumps "$bin" mangle PREROUTING
+        try "$bin" -t mangle -F "$CHAIN"
+        try "$bin" -t mangle -X "$CHAIN"
+    done
+}
 
 cmd_up() {
     load_state
@@ -530,6 +630,7 @@ cmd_up() {
         remove_v6_forwarding
         purge_stale_v6
     fi
+    remove_legacy_reply
     apply_routes up
     fw_apply up
     check_rp_filter
@@ -540,7 +641,7 @@ cmd_block() {
     load_state
     apply_routes block
     fw_apply block
-    note "telemt traffic from $SUBNET${SUBNET6:+ and $SUBNET6} is blocked (fail-closed)"
+    note "$LABEL traffic from $SUBNET${SUBNET6:+ and $SUBNET6} is blocked (fail-closed)"
 }
 
 cmd_down() {
@@ -548,6 +649,7 @@ cmd_down() {
     fw_remove
     remove_routes
     remove_v6_forwarding
+    remove_src_valid_mark
     note "outway rules for $SUBNET${SUBNET6:+ and $SUBNET6} removed"
 }
 
@@ -557,7 +659,7 @@ status_family() {
     if rule_present "$f" "$subnet"; then
         printf 'ip rule    : IPv%s present\n' "$f"
     else
-        printf 'ip rule    : IPv%s MISSING (telemt traffic is NOT policy-routed)\n' "$f"
+        printf 'ip rule    : IPv%s MISSING (%s traffic is NOT policy-routed)\n' "$f" "$LABEL"
         ST=bad
     fi
     route="$(ip "-$f" route show table "$TABLE" 2>/dev/null || true)"
@@ -565,9 +667,9 @@ status_family() {
     # shellcheck disable=SC2001
     [[ -z "$route" ]] || sed 's/^/    /' <<<"$route"
     if [[ "$(egress "$f")" != 1 ]]; then
-        printf 'state      : IPv%s is not carried by %s: telemt IPv%s traffic is dropped (fail-closed)\n' "$f" "$OUTWAY" "$f"
+        printf 'state      : IPv%s is not carried by %s: %s IPv%s traffic is dropped (fail-closed)\n' "$f" "$OUTWAY" "$LABEL" "$f"
     elif ! grep -Eq "^default .*dev ${OUTWAY//./\\.}( |\$)" <<<"$route"; then
-        printf 'state      : IPv%s BLOCKED (fail-closed): no route via %s, telemt traffic is dropped\n' "$f" "$OUTWAY"
+        printf 'state      : IPv%s BLOCKED (fail-closed): no route via %s, %s traffic is dropped\n' "$f" "$OUTWAY" "$LABEL"
         [[ "$ST" != ok ]] || ST=blocked
     fi
 }
@@ -598,11 +700,11 @@ cmd_status() {
         if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" == 1 ]]; then
             printf 'sysctl     : net.ipv6.conf.all.forwarding = 1\n'
         else
-            printf 'sysctl     : net.ipv6.conf.all.forwarding is NOT 1 (IPv6 of telemt is not forwarded)\n'
+            printf 'sysctl     : net.ipv6.conf.all.forwarding is NOT 1 (IPv6 of %s is not forwarded)\n' "$LABEL"
             ST=bad
         fi
     fi
-    [[ "$ST" != ok ]] || printf 'state      : OK, telemt egress goes out through %s (%s)\n' "$OUTWAY" "$(fams_name "$FAMILIES")"
+    [[ "$ST" != ok ]] || printf 'state      : OK, %s egress goes out through %s (%s)\n' "$LABEL" "$OUTWAY" "$(fams_name "$FAMILIES")"
     if systemctl is-enabled "$UNIT.service" >/dev/null 2>&1; then
         printf 'systemd    : %s.service enabled\n' "$UNIT"
     else
@@ -627,7 +729,7 @@ cmd_install_unit() {
     fi
     cat >"$UNIT_DIR/$UNIT.service" <<UNIT_EOF
 [Unit]
-Description=Telegram web proxy: outgoing interface (policy routing) of the telemt container
+Description=$TITLE: outgoing interface (policy routing) of the $LABEL container
 After=docker.service network-online.target
 Wants=network-online.target
 ConditionPathExists=$STATE_FILE
@@ -645,7 +747,7 @@ WantedBy=multi-user.target
 UNIT_EOF
     cat >"$UNIT_DIR/$UNIT-check.service" <<UNIT_EOF
 [Unit]
-Description=Telegram web proxy: re-apply the outway rules (VPN restarts, interface flaps)
+Description=$TITLE: re-apply the outway rules (VPN restarts, interface flaps)
 After=$UNIT.service
 ConditionPathExists=$STATE_FILE
 
@@ -655,7 +757,7 @@ ExecStart=$exec_self --quiet up
 UNIT_EOF
     cat >"$UNIT_DIR/$UNIT.timer" <<UNIT_EOF
 [Unit]
-Description=Telegram web proxy: periodic outway check
+Description=$TITLE: periodic outway check
 
 [Timer]
 OnBootSec=2min
@@ -710,6 +812,7 @@ main() {
         shift
     done
     [[ -n "$cmd" ]] || die "usage: $0 [--quiet] [--dry-run] up|block|down|status|list|names|resolve N|families IF|check IF|install-unit|remove-unit"
+    load_names
     if [[ "$DRY" != 1 ]]; then
         case "$cmd" in
             up | block | down | install-unit | remove-unit) ((EUID == 0)) || die "'$cmd' must run as root" ;;

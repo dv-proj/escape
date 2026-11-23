@@ -7,7 +7,7 @@
 # recorded as problems.
 check_project() {
     local f missing=0
-    for f in docker-compose.yml .env.example nginx/docker-compose.yml nginx/default.conf.template \
+    for f in docker-compose.yml .env.example nginx/docker-compose.yml nginx/default.conf.template nginx/stream.conf.template nginx/nginx.conf \
         fake-webapp/docker-compose.yml fake-webapp/Dockerfile fake-webapp/gen/login.py fake-webapp/gen/favicon.py; do
         [[ -f "$APP_DIR/$f" ]] || {
             problem "$(t app.missing_file "$f" "$APP_DIR")"

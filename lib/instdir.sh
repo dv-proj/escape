@@ -41,7 +41,7 @@ ORIG_ARGS=()
 SYNC_TOP_FILES=(install.sh docker-compose.yml .env.example README.md README.en.md)
 SYNC_MIRROR_DIRS=(lib nginx extensions.d fake-webapp)
 SYNC_FAKEAPP_FILES=(Dockerfile .dockerignore go.mod go.sum docker-compose.yml gen/login.py gen/favicon.py)
-SYNC_REQUIRED=(install.sh docker-compose.yml .env.example nginx/docker-compose.yml nginx/default.conf.template
+SYNC_REQUIRED=(install.sh docker-compose.yml .env.example nginx/docker-compose.yml nginx/default.conf.template nginx/stream.conf.template nginx/nginx.conf
     fake-webapp/docker-compose.yml fake-webapp/Dockerfile fake-webapp/gen/login.py fake-webapp/gen/favicon.py lib/commands.sh)
 
 is_installation() { [[ -f "$1/$INSTALL_MARKER" ]]; }

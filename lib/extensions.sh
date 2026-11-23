@@ -10,6 +10,7 @@
 #   ext_register_compose ID FILE / ext_unregister_compose ID
 #   ext_nginx_location_put ID (content on stdin) / ext_nginx_location_rm ID
 #   ext_nginx_server_put ID [CERT_NAME] (content on stdin) / ext_nginx_server_rm ID
+#   ext_nginx_stream_put ID (SNI routes on stdin) / ext_nginx_stream_rm ID
 #   ext_cert_request ID NAME / ext_cert_release ID [--delete] / ext_cert_paths NAME (lib/certs.sh)
 #   ext_domain, ext_compose
 # Optional hooks per extension (install phases, see cmd_install): the functions
@@ -185,13 +186,114 @@ ext_nginx_server_rm() {
     ok "$(t ext.server_removed "$id")"
 }
 
+# _ext_valid_sni NAME: a DNS name, or a wildcard of one (*.example.org / .example.org).
+_ext_valid_sni() {
+    local n=$1
+    n="${n#\*}"
+    n="${n#.}"
+    valid_domain "$n"
+}
+
+# _ext_server_names [ID]: the names of the server blocks of extensions (servers.d), one
+# per line; the file of the extension ID is left out.
+_ext_server_names() {
+    local f
+    for f in "$NGINX_DATA"/servers.d/*.conf; do
+        [[ -f "$f" && "$(basename "$f" .conf)" != "${1:-}" ]] && cat "$f"
+    done 2>/dev/null |
+        sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;]*\);.*/\1/p' | tr ' ' '\n' | sed '/^$/d' | tr '[:upper:]' '[:lower:]' || true
+}
+
+# _ext_valid_target HOST:PORT: a compose service (or other DNS name) and a port.
+_ext_valid_target() {
+    [[ "$1" =~ ^([a-z0-9][a-z0-9_.-]{0,62}):([0-9]{1,5})$ ]] && valid_port "${BASH_REMATCH[2]}"
+}
+
+# ext_nginx_stream_put ID: the TLS front (stream block on the host HTTPS port).
+# stdin: SNI routes, one per line "NAME HOST:PORT" (a trailing ";" and "#"
+# comments are allowed): connections whose TLS server name is NAME (exact, or a
+# wildcard "*.example.org" / ".example.org") go to HOST:PORT, usually a compose
+# service (resolved per connection through the Docker DNS, so nginx keeps
+# working while the service is down); all other names keep going to the HTTPS
+# server. Written to data/nginx/stream.d/<ID>.map. The target receives the PROXY
+# protocol (v1) header with the client address before the TLS bytes. Refused:
+# the name of the site (DOMAIN), names registered with ext_cert_request and the
+# server_name of server blocks in servers.d (their HTTPS server blocks), except
+# those of the extension ID itself (a name with its own certificate and decoy
+# server that the extension routes to its own inbound). Then `nginx -t` and reload (a running nginx
+# without the TLS front is recreated once); a rejected config is rolled back
+# and the script stops with an error.
+ext_nginx_stream_put() {
+    local id=${1:-} dir="$NGINX_DATA/stream.d" map tmap b_map="" line name target n=0 site
+    ext_valid_id "$id" || die "$(t ext.bad_id ext_nginx_stream_put "$id")"
+    site="$(site_domain)"
+    map="$dir/$id.map"
+    mkdir -p "$dir"
+    tmap="$(mktemp "$map.XXXXXX")"
+    printf '# TLS front routes of the extension %s (ext_nginx_stream_put): do not edit.\n' "$id" >"$tmap"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line//;/ }"
+        read -r name target _ <<<"$line" || true
+        [[ -n "${name:-}" ]] || continue
+        name="${name,,}"
+        if ! _ext_valid_sni "$name" || ! _ext_valid_target "${target:-}"; then
+            rm -f "$tmap"
+            die "$(t ext.stream_bad_route ext_nginx_stream_put "$name ${target:-}")"
+        fi
+        if [[ "$name" == "$site" ]] || ext_cert_list | awk -v n="$name" -v id="$id" '$2 == n && $1 != id {f = 1} END {exit !f}' ||
+            _ext_server_names "$id" | grep -qxF "$name"; then
+            rm -f "$tmap"
+            die "$(t ext.stream_sni_taken ext_nginx_stream_put "$name")"
+        fi
+        printf '%s %s;\n' "$name" "$target" >>"$tmap"
+        n=$((n + 1))
+    done
+    ((n)) || { rm -f "$tmap"; die "$(t ext.empty_stream ext_nginx_stream_put "$id")"; }
+    chmod 644 "$tmap"
+    _ext_nginx_stream_ready </dev/null
+    if [[ -f "$map" ]]; then b_map="$(mktemp "$map.bak.XXXXXX")" && cp -p "$map" "$b_map"; fi
+    mv -f "$tmap" "$map"
+    if ext_nginx_apply; then
+        [[ -z "$b_map" ]] || rm -f "$b_map"
+        ok "$(t ext.stream_ok "$id" "$map")"
+        return 0
+    fi
+    if [[ -n "$b_map" ]]; then mv -f "$b_map" "$map"; else rm -f "$map"; fi
+    die "$(t ext.nginx_rejected_stream "$id")"
+}
+
+# ext_nginx_stream_rm ID: delete data/nginx/stream.d/<ID>.map and reload.
+ext_nginx_stream_rm() {
+    local id=${1:-}
+    ext_valid_id "$id" || die "$(t ext.bad_id ext_nginx_stream_rm "$id")"
+    [[ -e "$NGINX_DATA/stream.d/$id.map" ]] || return 0
+    rm -f "$NGINX_DATA/stream.d/$id.map"
+    ext_nginx_apply || warn "$(t ext.nginx_after_rm "$id")"
+    ok "$(t ext.stream_removed "$id")"
+}
+
+# _ext_nginx_stream_ready: the TLS front is rendered and the running nginx has
+# it (an installation made before the front existed is migrated here: the
+# configs are rendered again and the nginx container is recreated once).
+_ext_nginx_stream_ready() {
+    mkdir -p "$NGINX_DATA/stream.d"
+    chmod a+rX "$NGINX_DATA/stream.d" 2>/dev/null || true
+    if [[ ! -f "$NGINX_DATA/conf.d/front.stream" ]] || ! grep -qF 'proxy_protocol' "$NGINX_DATA/conf.d/default.conf" 2>/dev/null; then
+        render_nginx_conf
+    fi
+    nginx_front_ready
+}
+
 # ext_nginx_apply: `nginx -t` and reload when the nginx container runs (else
-# the files are picked up at its next start). Fails when the test fails.
+# the files are picked up at its next start). Fails when the test fails. A
+# container without the TLS front is recreated first (see nginx_front_ready).
 ext_nginx_apply() {
     if ! stack_running nginx; then
         info "$(t ext.nginx_not_running)"
         return 0
     fi
+    nginx_front_ready </dev/null || return 1
     compose exec -T nginx nginx -t >&2 || return 1
     compose exec -T nginx nginx -s reload >&2
 }
