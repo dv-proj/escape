@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# fakeapp.sh - deploy the decoy web application (fake-webapp) next to an
-# existing Xray / 3X-UI install on Ubuntu/Debian.
+# fakeapp.sh - deploy a docker compose stack on Ubuntu/Debian: nginx (TLS
+# termination, Let's Encrypt certificates) in front of the decoy web
+# application (fake-webapp).
 #
-# Run `./fakeapp.sh --help` for usage. The service is defined in
-# fake-webapp/docker-compose.yml (included by docker-compose.yml). This script
-# makes sure Docker with the compose plugin is available (the system Docker is
-# reused, Docker CE is installed only when there is none), generates .env and
-# the decoy page, and starts one container that listens on
-# FAKEAPP_BIND:FAKEAPP_PORT (default 127.0.0.1:8080, plain HTTP). It never
-# touches nginx, Xray, 3X-UI, certificates or the firewall: add the app to
-# your nginx yourself (see README.md, or `./fakeapp.sh snippet`).
+# Run `./fakeapp.sh --help` for usage. The services are defined in
+# nginx/docker-compose.yml and fake-webapp/docker-compose.yml (both included
+# by docker-compose.yml). This script makes sure Docker with the compose plugin
+# is available (the system Docker is reused, Docker CE is installed only when
+# there is none), generates .env, the decoy page and the nginx config, starts
+# the stack, issues the certificate (certbot, webroot) and installs a renewal
+# timer. nginx publishes ports 80 and 443 of the host; the app itself is
+# reachable only inside the compose network. It never touches Xray, 3X-UI or
+# the firewall.
 set -Eeuo pipefail
 
 # --- bootstrap (curl | bash) --------------------------------------------------------
@@ -53,8 +55,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR"
 
-PREREQ_PKGS=(curl ca-certificates iproute2 python3)
+PREREQ_PKGS=(curl ca-certificates iproute2 python3 openssl)
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+
+DATA_DIR="$APP_DIR/data"
+NGINX_DATA="$DATA_DIR/nginx"
+LE_DIR="$DATA_DIR/letsencrypt"
+EXT_COMPOSE_FILE="$DATA_DIR/extensions.compose.yml"
+RENEW_UNIT="fakeapp-certbot-renew"
+RENEW_CRON=/etc/cron.d/fakeapp-certbot
 
 ASSUME_YES=0
 WITH_EXT=""
@@ -100,47 +109,53 @@ usage() {
     cat <<'USAGE'
 Usage: ./fakeapp.sh [options] <command>
 
-Deploys the decoy web application (fake-webapp) as one Docker container next
-to an existing Xray / 3X-UI install. The app listens on FAKEAPP_BIND:
-FAKEAPP_PORT of the host (default 127.0.0.1:8080, plain HTTP and h2c); TLS,
-certificates and routing stay with your own nginx (see README.md).
-Target systems: Ubuntu 22.04+ and Debian 12+.
+Deploys a docker compose stack: nginx in a container (ports 80 and 443 of the
+host, TLS with a Let's Encrypt certificate for DOMAIN) in front of the decoy
+web application (fake-webapp), which is reachable only inside the compose
+network. Target systems: Ubuntu 22.04+ and Debian 12+.
 
 Commands:
   install   Idempotent setup (root/sudo): reuses the system Docker (installs
             Docker CE only when docker is missing, the compose plugin when it
-            is missing), creates .env (asks for the site name, description,
-            keywords, DNS name and local port; the rest is generated),
-            generates the missing login.html and favicon.ico, builds and
-            starts the container. Re-running rebuilds and restarts it;
-            existing .env values and files in the data directory are kept.
-  start     Start the container (docker compose up -d --wait).
-  stop      Stop the container.
-  restart   Restart the container (e.g. after editing login.html).
-  status    Show the container state and check http://127.0.0.1:PORT/.
-  logs      Follow the container log (Ctrl+C to quit).
+            is missing), creates .env (asks for the DNS name of the site, the
+            Let's Encrypt e-mail, the site name, description and keywords; the
+            rest is generated), generates the missing login.html and
+            favicon.ico and the nginx config, builds and starts the stack,
+            obtains the certificate (certbot, webroot) and installs the renewal
+            timer. Re-running rebuilds and restarts it; existing .env values
+            and files in the data directory are kept.
+  start     Start the stack (docker compose up -d --wait).
+  stop      Stop the stack.
+  restart   Restart the stack (e.g. after editing login.html).
+  status    Show the container state, the certificate and check
+            https://DOMAIN/ on this host (curl --resolve to 127.0.0.1).
+  logs      Follow the container logs (Ctrl+C to quit).
+  renew     Renew the certificates and reload nginx (run by the timer; issues
+            the certificate when there is none yet). root/sudo.
   extensions  List additional features (extensions.d/); with --with ID,... install them.
-  snippet   Print an nginx location block that proxies to the app.
-  remove    Remove the container and its image (root/sudo). With --purge
-            also delete the data directory (login.html, favicon.ico and
-            your static files). .env, the project and Docker are kept.
+  remove    Remove the stack, its images and the renewal timer (root/sudo).
+            With --purge also delete the data directories (login.html,
+            favicon.ico and your static files; the nginx config and the
+            certificates). .env, the project and Docker are kept.
 
 Options:
   -y, --yes   Assume "yes" for every confirmation.
   --with IDS  Extensions to install without the menu (comma list or "all");
               also FAKEAPP_EXTENSIONS. Used by install and extensions.
-  --purge     With `remove`: also delete the data directory.
+  --purge     With `remove`: also delete the data directories.
   -h, --help  Show this help.
 
 Environment (used when install creates .env, without prompting):
-  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS, DOMAIN, FAKEAPP_PORT
+  DOMAIN, LE_EMAIL, LE_STAGING, NGINX_HTTP_PORT, NGINX_HTTPS_PORT, FAKEAPP_PORT,
+  APP_NAME, APP_DESCRIPTION, APP_KEYWORDS
               Unset APP_* values are generated at random (offered as defaults
               when interactive). Without a terminal every prompt uses its
-              default (FAKEAPP_PORT: the first free port from 8080).
+              default, except DOMAIN, which is required.
 
 Notes:
-  * Nothing is published to the internet: the app trusts X-Real-IP, keep
-    FAKEAPP_BIND=127.0.0.1 and let nginx on the same host proxy to it.
+  * Ports 80 and 443 must be free (stop the host nginx / Xray first).
+  * The site config is generated into data/nginx/ (do not edit it); extensions
+    add locations as data/nginx/locations.d/<id>.conf (extensions.d/README.md).
   * start/stop/restart/status/logs need access to Docker (root, sudo or the
     docker group).
 USAGE
@@ -188,10 +203,19 @@ require_root() {
 # environment, so that nothing from the caller (APP_NAME, DOCKER_HOST, ...)
 # overrides the values of .env.
 compose() {
+    ensure_ext_compose || true
     env -i -C "$APP_DIR" \
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         "HOME=${HOME:-/root}" "LANG=C.UTF-8" "TERM=${TERM:-dumb}" \
         docker compose "$@"
+}
+
+# ensure_ext_compose: data/extensions.compose.yml is included by
+# docker-compose.yml, so it must exist (empty: `services: {}`).
+ensure_ext_compose() {
+    [[ -f "$EXT_COMPOSE_FILE" ]] && return 0
+    mkdir -p "$DATA_DIR" 2>/dev/null && printf 'services: {}\n' >"$EXT_COMPOSE_FILE" 2>/dev/null || return 1
+    if [[ $EUID -eq 0 ]]; then chown "$(project_owner)" "$DATA_DIR" "$EXT_COMPOSE_FILE" 2>/dev/null || true; fi
 }
 
 daemon_ok() { docker info >/dev/null 2>&1; }
@@ -234,6 +258,16 @@ valid_text() {
 }
 valid_tz() { [[ "$1" =~ ^[A-Za-z0-9_+/-]{1,64}$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (($1 >= 1 && $1 <= 65535)); }
+valid_01() { [[ "$1" == 0 || "$1" == 1 ]]; }
+# valid_domain NAME: a DNS name with at least two labels (no IP addresses).
+valid_domain() {
+    ((${#1} <= 253)) || return 1
+    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+# valid_email ADDRESS: empty is fine (LE_EMAIL is optional).
+valid_email() {
+    [[ -z "$1" || "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
 
 # rand_str LENGTH CHARSET: random string from /dev/urandom.
 rand_str() {
@@ -297,20 +331,47 @@ ask() {
     ENV_VALUES[$key]="$value"
 }
 
-# ask_domain: optional DOMAIN (DNS name or IP address, not checked) into
-# ENV_VALUES[DOMAIN]. From the environment if set; else asked when
-# interactive (empty allowed); else empty. Surrounding spaces are trimmed.
+# ask_domain: DOMAIN (required DNS name) into ENV_VALUES[DOMAIN]. From the
+# environment if set; else asked when interactive (repeats until valid); else
+# an error. Surrounding spaces are trimmed, the name is lowercased.
 ask_domain() {
-    local v=""
-    if [[ -n "${DOMAIN:-}" ]]; then
-        v="$DOMAIN"
-    elif [[ -t 0 ]]; then
-        read -r -p "DNS name of the site served by your nginx, e.g. app.example.com (empty: none): " v || die "no input"
-    fi
+    local v="${DOMAIN:-}"
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
-    [[ -z "${DOMAIN:-}" ]] || info "DOMAIN (from environment): $v"
-    ENV_VALUES[DOMAIN]="$v"
+    if [[ -n "$v" ]]; then
+        valid_domain "$v" || die "DOMAIN from the environment is invalid: expected a DNS name like app.example.com"
+        info "DOMAIN (from environment): $v"
+    elif [[ -t 0 ]]; then
+        while :; do
+            read -r -p "DNS name of the site (its A record must point to this server), e.g. app.example.com: " v || die "no input"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            valid_domain "$v" && break
+            warn "invalid value; expected a DNS name like app.example.com"
+        done
+    else
+        die "DOMAIN is required (set it in the environment; no terminal to ask)"
+    fi
+    ENV_VALUES[DOMAIN]="${v,,}"
+}
+
+# ask_le_email: optional LE_EMAIL into ENV_VALUES[LE_EMAIL] (environment, else
+# asked when interactive, else empty).
+ask_le_email() {
+    local v="${LE_EMAIL:-}"
+    if [[ -n "$v" ]]; then
+        valid_email "$v" || die "LE_EMAIL from the environment is invalid"
+        info "LE_EMAIL (from environment): $v"
+    elif [[ -t 0 ]]; then
+        while :; do
+            read -r -p "E-mail for Let's Encrypt expiry notices (empty: none): " v || die "no input"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            valid_email "$v" && break
+            warn "invalid e-mail address"
+        done
+    fi
+    ENV_VALUES[LE_EMAIL]="$v"
 }
 
 # port_in_use PORT: something listens on TCP PORT of the host (any address).
@@ -337,7 +398,7 @@ first_free_port() {
 
 # Keys of .env.example that may stay empty.
 is_optional_key() {
-    [[ "$1" == DOMAIN ]]
+    [[ "$1" == LE_EMAIL ]]
 }
 
 # --- generated values -------------------------------------------------------------------
@@ -516,6 +577,10 @@ sync_env_with_example() {
             gen="$(generator_for "$key")"
             if [[ -n "$gen" && -z "$(env_get "$envf" "$key")" ]]; then
                 ensure_generated_key "$envf" "$key" "$gen"
+            elif [[ "$key" == DOMAIN && -z "$(env_get "$envf" DOMAIN)" ]]; then
+                ask_domain
+                env_set "$envf" DOMAIN "${ENV_VALUES[DOMAIN]}"
+                info "DOMAIN set in $envf"
             fi
             continue
         fi
@@ -528,6 +593,9 @@ sync_env_with_example() {
         elif [[ "$key" == DOMAIN ]]; then
             ask_domain
             val="${ENV_VALUES[DOMAIN]}"
+        elif [[ "$key" == LE_EMAIL ]]; then
+            ask_le_email
+            val="${ENV_VALUES[LE_EMAIL]}"
         elif is_optional_key "$key"; then
             val=""
         else
@@ -558,8 +626,18 @@ generate_env() {
     ask APP_DESCRIPTION "Decoy site description" "$GEN_APP_DESCRIPTION" valid_text "1-200 characters without ' \" \$ \` \\"
     ask APP_KEYWORDS "Decoy site keywords" "$GEN_APP_KEYWORDS" valid_text "1-200 characters without ' \" \$ \` \\"
     ask_domain
-    ask FAKEAPP_PORT "Local port of the app (nginx will proxy to 127.0.0.1:PORT)" \
-        "$(first_free_port 8080)" valid_free_port "a free TCP port 1024-65535"
+    ask_le_email
+    # Not asked: taken from the environment when set (else the .env.example default).
+    local ev
+    for ev in FAKEAPP_PORT NGINX_HTTP_PORT NGINX_HTTPS_PORT LE_STAGING; do
+        [[ -n "${!ev:-}" ]] || continue
+        case "$ev" in
+            LE_STAGING) valid_01 "${!ev}" || die "$ev from the environment must be 0 or 1" ;;
+            *) valid_port "${!ev}" || die "$ev from the environment must be a port 1-65535" ;;
+        esac
+        ENV_VALUES[$ev]="${!ev}"
+        info "$ev (from environment): ${!ev}"
+    done
     def_tz="$(host_timezone)"
     # TZ is deliberately not read from the environment (often set to odd values).
     local saved_tz="${TZ-__unset__}"
@@ -772,8 +850,8 @@ ensure_docker() {
 
 check_project() {
     local f
-    for f in docker-compose.yml .env.example fake-webapp/docker-compose.yml fake-webapp/Dockerfile \
-        fake-webapp/gen/login.py fake-webapp/gen/favicon.py; do
+    for f in docker-compose.yml .env.example nginx/docker-compose.yml nginx/default.conf.template \
+        fake-webapp/docker-compose.yml fake-webapp/Dockerfile fake-webapp/gen/login.py fake-webapp/gen/favicon.py; do
         [[ -f "$APP_DIR/$f" ]] || die "$f missing in $APP_DIR"
     done
     ok "project: $APP_DIR"
@@ -784,6 +862,7 @@ setup_env() {
     if [[ -f "$envf" ]]; then
         ok "$envf exists; reusing it (no questions asked)"
         sync_env_with_example "$envf" "$APP_DIR/.env.example"
+        valid_domain "$(env_get "$envf" DOMAIN)" || die "DOMAIN in $envf is not a valid DNS name; fix it and re-run install"
         return 0
     fi
     info "creating $envf"
@@ -802,22 +881,32 @@ fakeapp_port() {
     printf '%s' "$p"
 }
 
-# fakeapp_bind: FAKEAPP_BIND from .env (default 127.0.0.1).
-fakeapp_bind() {
-    local b
-    b="$(env_get "$APP_DIR/.env" FAKEAPP_BIND)"
-    printf '%s' "${b:-127.0.0.1}"
+# env_or_default KEY DEFAULT: value of KEY from .env, else DEFAULT.
+env_or_default() {
+    local v
+    v="$(env_get "$APP_DIR/.env" "$1")"
+    printf '%s' "${v:-$2}"
 }
 
-# fakeapp_url_host: address nginx on this host uses to reach the app.
-fakeapp_url_host() {
-    local b
-    b="$(fakeapp_bind)"
-    case "$b" in
-        0.0.0.0 | '' ) printf '127.0.0.1' ;;
-        *:*) printf '[%s]' "$b" ;;
-        *) printf '%s' "$b" ;;
-    esac
+site_domain() {
+    local d
+    d="$(env_get "$APP_DIR/.env" DOMAIN)"
+    valid_domain "$d" || die "DOMAIN in $APP_DIR/.env is missing or not a DNS name (got '$d'); set it and re-run install"
+    printf '%s' "$d"
+}
+
+nginx_http_port() {
+    local p
+    p="$(env_or_default NGINX_HTTP_PORT 80)"
+    valid_port "$p" || die "NGINX_HTTP_PORT in $APP_DIR/.env must be 1-65535 (got '$p')"
+    printf '%s' "$p"
+}
+
+nginx_https_port() {
+    local p
+    p="$(env_or_default NGINX_HTTPS_PORT 443)"
+    valid_port "$p" || die "NGINX_HTTPS_PORT in $APP_DIR/.env must be 1-65535 (got '$p')"
+    printf '%s' "$p"
 }
 
 # fakeapp_data_dir: host data directory, resolved like compose does (relative
@@ -830,17 +919,29 @@ fakeapp_data_dir() {
     realpath -m "$d"
 }
 
-# check_port_free: the port of .env must be free, or already ours.
+# port_holder PORT: the program listening on TCP PORT (needs root for others' sockets).
+port_holder() {
+    ss -Hltnp "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | sed 's/^users:(("//; s/"$//' || true
+}
+
+# stack_running SERVICE: the compose service has a running container.
+stack_running() {
+    [[ -n "$(compose ps -q "$1" 2>/dev/null)" ]]
+}
+
+# check_port_free: the nginx host ports (80/443) must be free, or already ours.
 check_port_free() {
-    local port bind
-    port="$(fakeapp_port)"
-    bind="$(fakeapp_bind)"
-    [[ "$bind" == 127.0.0.1 || "$bind" == ::1 ]] ||
-        warn "FAKEAPP_BIND=$bind: the app is reachable beyond localhost; it trusts X-Real-IP, so block the port in the firewall"
-    if port_in_use "$port" && [[ -z "$(compose ps -q fakeapp 2>/dev/null)" ]]; then
-        die "port $port is already in use by another program (ss -ltnp 'sport = :$port'); set another FAKEAPP_PORT in $APP_DIR/.env and re-run install"
-    fi
-    ok "port $port on $bind"
+    local port holder
+    for port in "$(nginx_http_port)" "$(nginx_https_port)"; do
+        if port_in_use "$port" && ! stack_running nginx; then
+            holder="$(port_holder "$port")"
+            # shellcheck disable=SC2016
+            die "port $port is already in use${holder:+ by '$holder'} (another nginx / Xray / 3X-UI?); stop it or move it to another port, check with: ss -ltnp 'sport = :$port'. The nginx of this stack needs ports $(nginx_http_port) and $(nginx_https_port) (NGINX_HTTP_PORT / NGINX_HTTPS_PORT in $APP_DIR/.env)"
+        fi
+    done
+    ok "ports $(nginx_http_port) and $(nginx_https_port) are free for nginx"
+    [[ "$(nginx_http_port)" == 80 ]] ||
+        warn "NGINX_HTTP_PORT=$(nginx_http_port): Let's Encrypt validates on port 80 only; forward it here or issuing the certificate fails"
 }
 
 # prepare_data_dir: create the data directory, generate the missing
@@ -876,68 +977,373 @@ prepare_data_dir() {
     ok "$d is readable for the container (mounted read-only)"
 }
 
-# check_http: the app answers 200 on / of the published port.
-check_http() {
-    local url
-    url="http://$(fakeapp_url_host):$(fakeapp_port)/"
-    if curl -fs -o /dev/null --max-time 5 "$url"; then
-        ok "$url answers"
+# --- nginx config and certificates -----------------------------------------------------------------
+
+# ensure_selfsigned DOMAIN: temporary certificate so that nginx can start
+# before Let's Encrypt has issued the real one (kept while it matches DOMAIN).
+ensure_selfsigned() {
+    local domain=$1 dir="$NGINX_DATA/selfsigned"
+    mkdir -p "$dir"
+    if [[ -s "$dir/fullchain.pem" && -s "$dir/privkey.pem" ]] &&
+        openssl x509 -in "$dir/fullchain.pem" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match'; then
+        return 0
+    fi
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$domain" \
+        -addext "subjectAltName=DNS:$domain" \
+        -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" 2>/dev/null ||
+        die "cannot create the temporary self-signed certificate (openssl)"
+    chmod 600 "$dir/privkey.pem"
+    info "temporary self-signed certificate created for $domain"
+}
+
+# have_le_cert DOMAIN: a Let's Encrypt certificate for DOMAIN exists.
+have_le_cert() {
+    [[ -s "$LE_DIR/live/$1/fullchain.pem" && -s "$LE_DIR/live/$1/privkey.pem" ]]
+}
+
+# render_nginx_conf [TEMPLATE OUT]: fill nginx/default.conf.template from .env
+# (default OUT: data/nginx/conf.d/default.conf). The Let's Encrypt certificate
+# is used when it exists, else the temporary self-signed one.
+render_nginx_conf() {
+    local tpl="${1:-$APP_DIR/nginx/default.conf.template}"
+    local out="${2:-$NGINX_DATA/conf.d/default.conf}"
+    local domain port https_port cert key suffix content tmp
+    domain="$(site_domain)"
+    port="$(fakeapp_port)"
+    https_port="$(nginx_https_port)"
+    suffix=""
+    [[ "$https_port" == 443 ]] || suffix=":$https_port"
+    if have_le_cert "$domain"; then
+        cert="/etc/letsencrypt/live/$domain/fullchain.pem"
+        key="/etc/letsencrypt/live/$domain/privkey.pem"
+    else
+        cert=/etc/nginx/selfsigned/fullchain.pem
+        key=/etc/nginx/selfsigned/privkey.pem
+    fi
+    [[ -f "$tpl" ]] || die "template not found: $tpl"
+    content="$(<"$tpl")"
+    content="${content//@DOMAIN@/$domain}"
+    content="${content//@FAKEAPP_PORT@/$port}"
+    content="${content//@HTTPS_PORT_SUFFIX@/$suffix}"
+    content="${content//@SSL_CERT@/$cert}"
+    content="${content//@SSL_KEY@/$key}"
+    mkdir -p "$(dirname "$out")"
+    tmp="$(mktemp "$out.XXXXXX")"
+    printf '%s\n' "$content" >"$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$out"
+}
+
+# prepare_nginx_dir: data/nginx/{conf.d,locations.d,webroot,selfsigned}, the
+# temporary certificate and the rendered config.
+prepare_nginx_dir() {
+    local d owner
+    owner="$(project_owner)"
+    mkdir -p "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot" "$NGINX_DATA/selfsigned" "$LE_DIR"
+    ensure_selfsigned "$(site_domain)"
+    render_nginx_conf
+    chmod -R a+rX "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot"
+    for d in "$DATA_DIR" "$NGINX_DATA" "$NGINX_DATA/conf.d" "$NGINX_DATA/locations.d" "$NGINX_DATA/webroot"; do
+        chown "$owner" "$d" 2>/dev/null || true
+    done
+    ok "nginx config rendered: $NGINX_DATA/conf.d/default.conf ($(have_le_cert "$(site_domain)" && echo "Let's Encrypt certificate" || echo "temporary self-signed certificate"))"
+}
+
+# nginx_reload: test the config in the running container and reload it.
+nginx_reload() {
+    compose exec -T nginx nginx -t >/dev/null 2>&1 || {
+        compose exec -T nginx nginx -t >&2 || true
+        return 1
+    }
+    compose exec -T nginx nginx -s reload >/dev/null 2>&1
+}
+
+# issue_certificate: Let's Encrypt via the one-shot certbot container
+# (webroot). Returns 1 with a hint on failure; callers carry on.
+issue_certificate() {
+    local domain email
+    domain="$(site_domain)"
+    email="$(env_get "$APP_DIR/.env" LE_EMAIL)"
+    local -a args=(certonly --webroot -w /var/www/acme -d "$domain" --cert-name "$domain"
+        --non-interactive --agree-tos --keep-until-expiring)
+    if [[ -n "$email" ]]; then
+        args+=(--email "$email" --no-eff-email)
+    else
+        args+=(--register-unsafely-without-email)
+    fi
+    [[ "$(env_or_default LE_STAGING 0)" != 1 ]] || {
+        args+=(--staging)
+        warn "LE_STAGING=1: the certificate will not be trusted by browsers"
+    }
+    info "requesting a certificate for $domain from Let's Encrypt"
+    if ! compose run --rm -T certbot "${args[@]}" >&2; then
+        warn "could not obtain a certificate for $domain; nginx keeps serving the temporary self-signed one"
+        info "check that: the DNS A/AAAA record of $domain points to this server;"
+        info "            port 80 is reachable from the internet (firewall, cloud security group) and is served by this stack;"
+        info "            Let's Encrypt rate limits are not hit (try LE_STAGING=1 for tests)."
+        info "then retry with: sudo ./fakeapp.sh renew   (or re-run install)"
+        return 1
+    fi
+    ok "certificate issued for $domain"
+    render_nginx_conf
+    if nginx_reload; then
+        ok "nginx reloaded with the new certificate"
+    else
+        warn "nginx did not reload (see: ./fakeapp.sh logs)"
+        return 1
+    fi
+}
+
+# renew_certificates: the work of the timer: renew, then reload nginx.
+renew_certificates() {
+    local domain
+    domain="$(site_domain)"
+    if ! have_le_cert "$domain"; then
+        issue_certificate
+        return
+    fi
+    compose run --rm -T certbot renew --quiet >&2 || {
+        warn "certbot renew failed"
+        return 1
+    }
+    render_nginx_conf
+    nginx_reload || {
+        warn "nginx did not reload"
+        return 1
+    }
+    ok "certificates checked, nginx reloaded"
+}
+
+# install_renew_timer: systemd timer (twice a day) running `fakeapp.sh renew`;
+# /etc/cron.d entry when systemd is not running.
+install_renew_timer() {
+    local script="$APP_DIR/fakeapp.sh"
+    if [[ -d /run/systemd/system ]]; then
+        cat >"/etc/systemd/system/$RENEW_UNIT.service" <<UNIT
+[Unit]
+Description=Renew Let's Encrypt certificates of the fakeapp stack
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart="$script" renew
+UNIT
+        cat >"/etc/systemd/system/$RENEW_UNIT.timer" <<UNIT
+[Unit]
+Description=Renew Let's Encrypt certificates of the fakeapp stack twice a day
+
+[Timer]
+OnCalendar=*-*-* 03,15:17:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+        systemctl daemon-reload
+        if systemctl enable --now "$RENEW_UNIT.timer" >/dev/null 2>&1; then
+            ok "renewal timer installed: $RENEW_UNIT.timer (systemctl list-timers $RENEW_UNIT.timer)"
+            rm -f "$RENEW_CRON"
+            return 0
+        fi
+        warn "could not enable $RENEW_UNIT.timer; using $RENEW_CRON instead"
+    fi
+    printf '# Renew Let'"'"'s Encrypt certificates of the fakeapp stack (installed by fakeapp.sh).\n17 3,15 * * * root "%s" renew >/dev/null 2>&1\n' "$script" >"$RENEW_CRON"
+    chmod 644 "$RENEW_CRON"
+    ok "renewal cron entry installed: $RENEW_CRON"
+}
+
+# remove_renew_timer: remove the systemd timer and the cron entry.
+remove_renew_timer() {
+    if [[ -f "/etc/systemd/system/$RENEW_UNIT.timer" ]]; then
+        systemctl disable --now "$RENEW_UNIT.timer" >/dev/null 2>&1 || true
+    fi
+    rm -f "/etc/systemd/system/$RENEW_UNIT.timer" "/etc/systemd/system/$RENEW_UNIT.service" "$RENEW_CRON"
+    [[ ! -d /run/systemd/system ]] || systemctl daemon-reload 2>/dev/null || true
+}
+
+renew_timer_state() {
+    if [[ -f "/etc/systemd/system/$RENEW_UNIT.timer" ]]; then
+        printf 'systemd timer %s (%s)' "$RENEW_UNIT.timer" "$(systemctl is-active "$RENEW_UNIT.timer" 2>/dev/null || true)"
+    elif [[ -f "$RENEW_CRON" ]]; then
+        printf 'cron entry %s' "$RENEW_CRON"
+    else
+        printf 'not installed (run: sudo ./fakeapp.sh install)'
+    fi
+}
+
+# check_https: https://DOMAIN/ answers on this host (curl --resolve to
+# 127.0.0.1). A certificate that is not trusted (self-signed, LE_STAGING) is
+# only a warning; no answer at all fails.
+check_https() {
+    local domain port url
+    domain="$(site_domain)"
+    port="$(nginx_https_port)"
+    url="https://$domain/"
+    [[ "$port" == 443 ]] || url="https://$domain:$port/"
+    if curl -fs -o /dev/null --max-time 8 --resolve "$domain:$port:127.0.0.1" "$url"; then
+        ok "$url answers (nginx -> fakeapp, trusted certificate)"
+    elif curl -fsk -o /dev/null --max-time 8 --resolve "$domain:$port:127.0.0.1" "$url"; then
+        warn "$url answers, but the certificate is not trusted yet (temporary self-signed or LE_STAGING=1)"
     else
         warn "$url does not answer (see: ./fakeapp.sh logs)"
         return 1
     fi
 }
 
-# --- nginx snippet and summary ---------------------------------------------------------------------
-
-print_snippet() {
-    local up
-    up="http://$(fakeapp_url_host):$(fakeapp_port)"
-    cat <<EOS
-# fake-webapp: put this into the server { } block of your site (see README.md).
-# Locations of Xray (ws/grpc/xhttp paths) and the 3X-UI panel stay as they are;
-# everything else goes to the decoy site.
-location / {
-    proxy_pass $up;
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_set_header Host \$host;
-    # The app rate-limits by X-Real-IP: always overwrite it.
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$remote_addr;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_connect_timeout 5s;
-    proxy_read_timeout 60s;
-}
-EOS
+# cert_summary: one line about the certificate nginx serves.
+cert_summary() {
+    local domain f end
+    domain="$(site_domain)"
+    if have_le_cert "$domain"; then
+        end="$(openssl x509 -in "$LE_DIR/live/$domain/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)"
+        printf "Let's Encrypt%s, expires %s" "$([[ "$(env_or_default LE_STAGING 0)" != 1 ]] || printf ' (staging)')" "${end:-unknown}"
+    else
+        printf 'temporary self-signed (no Let'"'"'s Encrypt certificate yet: sudo ./fakeapp.sh renew)'
+    fi
 }
 
 print_summary() {
-    local envf="$APP_DIR/.env" domain up
-    domain="$(env_get "$envf" DOMAIN)"
-    up="http://$(fakeapp_url_host):$(fakeapp_port)"
+    local envf="$APP_DIR/.env" domain port suffix=""
+    domain="$(site_domain)"
+    port="$(nginx_https_port)"
+    [[ "$port" == 443 ]] || suffix=":$port"
     printf '\n'
     printf 'App name  : %s\n' "$(env_get "$envf" APP_NAME)"
-    printf 'Upstream  : %s/ (published on %s; point nginx here)\n' "$up" "$(fakeapp_bind)"
-    if [[ -n "$domain" ]]; then
-        printf 'Site      : https://%s/ (canonical link and og:url; TLS is up to your nginx)\n' "$domain"
-    else
-        printf 'Site      : no DOMAIN set (canonical link and og:url are not emitted)\n'
-    fi
-    printf 'Random    : %s/random-%s?size=1000 (0-500000 bytes)\n' "$up" "$(env_get "$envf" RANDOM_DATA_SUFFIX)"
+    printf 'Site      : https://%s%s/ (nginx container on ports %s/%s; the app is internal: http://fakeapp:%s)\n' \
+        "$domain" "$suffix" "$(nginx_http_port)" "$port" "$(fakeapp_port)"
+    printf 'Certificate: %s\n' "$(cert_summary)"
+    printf 'Renewal   : %s\n' "$(renew_timer_state)"
+    printf 'Random    : https://%s%s/random-%s?size=1000 (0-500000 bytes)\n' "$domain" "$suffix" "$(env_get "$envf" RANDOM_DATA_SUFFIX)"
     printf 'Files     : %s (login.html: ./fakeapp.sh restart after editing; other files are served as is)\n' "$(fakeapp_data_dir)"
-    printf '\nNext: add the app to your nginx (README.md, section "nginx"). Ready block:\n'
-    printf '  ./fakeapp.sh snippet\n'
+    printf 'nginx     : %s/conf.d/default.conf is generated (do not edit); extensions add locations in %s/locations.d/\n' "$NGINX_DATA" "$NGINX_DATA"
 }
 
 # --- extensions ---------------------------------------------------------------------------------------
 # Each extension is one file extensions.d/<NN>-<id>.sh (see extensions.d/README.md).
 # Files are only added, never edited here, so branches adding extensions do not
 # conflict on merge. A file calls: register_extension ID "Title" INSTALL_FN.
+# Helpers for extension files (documented in extensions.d/README.md):
+#   ext_register_compose ID FILE / ext_unregister_compose ID
+#   ext_nginx_location_put ID (content on stdin) / ext_nginx_location_rm ID
+#   ext_domain, ext_compose
 
 EXT_IDS=()
 declare -A EXT_TITLE=() EXT_FN=()
 EXT_SELECTED=""
+
+# ext_valid_id ID: an identifier usable as a file name and a compose key.
+ext_valid_id() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; }
+
+# ext_compose ARGS...: the project's docker compose wrapper (all included files).
+ext_compose() { compose "$@"; }
+
+# ext_domain: DOMAIN of .env.
+ext_domain() { env_get "$APP_DIR/.env" DOMAIN; }
+
+# _ext_compose_rewrite ID PATH: set (PATH non-empty) or drop (PATH empty) the
+# entry of ID in data/extensions.compose.yml, keeping the other entries.
+# File format: `services: {}` when empty, else an `include:` list of lines
+#   - "/absolute/path/to/compose.yml" # <id>
+_ext_compose_rewrite() {
+    local id=$1 path=$2 line i tmp
+    local -a ids=() paths=()
+    if [[ -f "$EXT_COMPOSE_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+\"(.*)\"[[:space:]]+#[[:space:]]+([a-z0-9][a-z0-9_-]*)$ ]]; then
+                [[ "${BASH_REMATCH[2]}" != "$id" ]] || continue
+                paths+=("${BASH_REMATCH[1]}")
+                ids+=("${BASH_REMATCH[2]}")
+            fi
+        done <"$EXT_COMPOSE_FILE"
+    fi
+    if [[ -n "$path" ]]; then
+        ids+=("$id")
+        paths+=("$path")
+    fi
+    mkdir -p "$DATA_DIR"
+    tmp="$(mktemp "$EXT_COMPOSE_FILE.XXXXXX")"
+    if ((${#ids[@]})); then
+        {
+            printf '# Generated by fakeapp.sh (ext_register_compose): do not edit.\ninclude:\n'
+            for i in "${!ids[@]}"; do
+                printf '  - "%s" # %s\n' "${paths[i]}" "${ids[i]}"
+            done
+        } >"$tmp"
+    else
+        printf 'services: {}\n' >"$tmp"
+    fi
+    chmod 644 "$tmp"
+    if [[ $EUID -eq 0 ]]; then chown "$(project_owner)" "$tmp" 2>/dev/null || true; fi
+    mv -f "$tmp" "$EXT_COMPOSE_FILE"
+}
+
+# ext_register_compose ID FILE: include the compose file FILE (an extension's
+# services) in the stack: data/extensions.compose.yml is rewritten.
+ext_register_compose() {
+    local id=${1:-} file=${2:-}
+    ext_valid_id "$id" || die "ext_register_compose: bad id '$id'"
+    [[ -f "$file" ]] || die "ext_register_compose: compose file not found: '$file'"
+    file="$(realpath "$file")"
+    [[ "$file" != *[\"$'\n']* ]] || die "ext_register_compose: unsupported characters in '$file'"
+    _ext_compose_rewrite "$id" "$file"
+    ok "compose file registered for '$id': $file"
+}
+
+# ext_unregister_compose ID: drop the entry of ID (stop its containers first).
+ext_unregister_compose() {
+    local id=${1:-}
+    ext_valid_id "$id" || die "ext_unregister_compose: bad id '$id'"
+    _ext_compose_rewrite "$id" ""
+    ok "compose file unregistered for '$id'"
+}
+
+# ext_nginx_location_put ID: write stdin to data/nginx/locations.d/<ID>.conf (a
+# location block, included in the 443 server before `location /`), then test
+# the config and reload nginx when it runs. A rejected config is rolled back.
+ext_nginx_location_put() {
+    local id=${1:-} dir="$NGINX_DATA/locations.d" file tmp backup=""
+    ext_valid_id "$id" || die "ext_nginx_location_put: bad id '$id'"
+    file="$dir/$id.conf"
+    mkdir -p "$dir"
+    tmp="$(mktemp "$file.XXXXXX")"
+    cat >"$tmp"
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; die "ext_nginx_location_put: empty location for '$id'"; }
+    chmod 644 "$tmp"
+    if [[ -f "$file" ]]; then
+        backup="$(mktemp "$file.bak.XXXXXX")"
+        cp -p "$file" "$backup"
+    fi
+    mv -f "$tmp" "$file"
+    if ext_nginx_apply; then
+        [[ -z "$backup" ]] || rm -f "$backup"
+        ok "nginx location '$id' installed: $file"
+        return 0
+    fi
+    if [[ -n "$backup" ]]; then mv -f "$backup" "$file"; else rm -f "$file"; fi
+    die "nginx rejected the location '$id' (rolled back); see the message above"
+}
+
+# ext_nginx_location_rm ID: delete data/nginx/locations.d/<ID>.conf and reload.
+ext_nginx_location_rm() {
+    local id=${1:-}
+    ext_valid_id "$id" || die "ext_nginx_location_rm: bad id '$id'"
+    rm -f "$NGINX_DATA/locations.d/$id.conf"
+    ext_nginx_apply || warn "nginx did not accept the config after removing '$id'"
+    ok "nginx location '$id' removed"
+}
+
+# ext_nginx_apply: `nginx -t` and reload when the nginx container runs (else
+# the files are picked up at its next start). Fails when the test fails.
+ext_nginx_apply() {
+    if ! stack_running nginx; then
+        info "nginx is not running; the locations are used at its next start"
+        return 0
+    fi
+    compose exec -T nginx nginx -t >&2 || return 1
+    compose exec -T nginx nginx -s reload >&2
+}
 
 register_extension() {
     local id=$1
@@ -1010,7 +1416,7 @@ cmd_install() {
     select_extensions
     local ext_count
     ext_count=$(wc -w <<<"$EXT_SELECTED")
-    STEP_TOTAL=$((6 + ext_count))
+    STEP_TOTAL=$((8 + ext_count))
     check_system_tools
 
     step "Checking the project directory"
@@ -1025,13 +1431,20 @@ cmd_install() {
     step "Preparing .env"
     setup_env
 
-    step "Preparing the port and the data directory (login.html, favicon.ico)"
+    step "Checking ports 80/443, preparing the data directory and the nginx config"
     check_port_free
     prepare_data_dir
+    prepare_nginx_dir
 
-    step "Building and starting fakeapp"
+    step "Building and starting nginx and fakeapp"
     compose up -d --build --wait
-    check_http || true
+    check_https || true
+
+    step "Obtaining the Let's Encrypt certificate"
+    issue_certificate || true
+
+    step "Installing the certificate renewal timer"
+    install_renew_timer
 
     run_extensions
 
@@ -1057,11 +1470,18 @@ cmd_extensions() {
     fi
 }
 
+# refresh_nginx_conf: re-render the config before (re)starting; not fatal for
+# users that may only run docker (the existing file is then used).
+refresh_nginx_conf() {
+    prepare_nginx_dir >/dev/null 2>&1 || warn "could not refresh the nginx config in $NGINX_DATA (need root?); using the existing one"
+}
+
 cmd_start() {
     require_installed
     require_docker
+    refresh_nginx_conf
     compose up -d --wait
-    check_http || true
+    check_https || true
 }
 
 cmd_stop() {
@@ -1073,16 +1493,19 @@ cmd_stop() {
 cmd_restart() {
     require_installed
     require_docker
+    refresh_nginx_conf
     compose restart
     compose up -d --wait
-    check_http || true
+    check_https || true
 }
 
 cmd_status() {
     require_installed
     require_docker
     compose ps
-    check_http || exit 1
+    printf 'Certificate: %s\n' "$(cert_summary)"
+    printf 'Renewal    : %s\n' "$(renew_timer_state)"
+    check_https || exit 1
 }
 
 cmd_logs() {
@@ -1091,12 +1514,15 @@ cmd_logs() {
     compose logs -f --tail 100
 }
 
-cmd_snippet() {
+cmd_renew() {
     require_installed
-    print_snippet
+    require_docker
+    STEP_TOTAL=1
+    step "Renewing the certificates"
+    renew_certificates
 }
 
-# remove_data_dir PATH: delete the data directory (refuses odd paths).
+# remove_data_dir PATH: delete a data directory (refuses odd paths).
 remove_data_dir() {
     local path=$1
     [[ "$path" =~ ^/[^/]+/[^/]+ && "$path" != "$HOME" ]] || die "refusing to delete suspicious path '$path'"
@@ -1106,17 +1532,20 @@ remove_data_dir() {
 
 cmd_remove() {
     require_root remove
-    STEP_TOTAL=$((PURGE ? 2 : 1))
+    STEP_TOTAL=$((PURGE ? 3 : 2))
     local data_dir=""
     [[ -f "$APP_DIR/.env" ]] && data_dir="$(fakeapp_data_dir)"
 
     if ((PURGE)); then
-        confirm "Remove the container, its image and the data directory${data_dir:+ $data_dir}?" || die "aborted"
+        confirm "Remove the containers, their images, the renewal timer and the data (${data_dir:+$data_dir, }$NGINX_DATA, $LE_DIR)?" || die "aborted"
     else
-        confirm "Stop and remove the container and its image (data is kept)?" || die "aborted"
+        confirm "Stop and remove the containers, their images and the renewal timer (data and certificates are kept)?" || die "aborted"
     fi
 
-    step "Removing the container and the image"
+    step "Removing the renewal timer"
+    remove_renew_timer
+
+    step "Removing the containers and the images"
     if [[ -f "$APP_DIR/.env" ]] && command -v docker >/dev/null 2>&1 && daemon_ok; then
         compose down --remove-orphans --rmi local
     else
@@ -1124,15 +1553,15 @@ cmd_remove() {
     fi
 
     if ((!PURGE)); then
-        info "data${data_dir:+ in $data_dir} and .env were kept (use --purge to delete the data)"
-        info "remember to remove the fake-webapp location from your nginx config"
+        info "data${data_dir:+ in $data_dir}, $NGINX_DATA, $LE_DIR and .env were kept (use --purge to delete the data)"
         return 0
     fi
 
-    step "Deleting the data${data_dir:+ ($data_dir)}"
+    step "Deleting the data"
     [[ -z "$data_dir" ]] || remove_data_dir "$data_dir"
+    remove_data_dir "$NGINX_DATA"
+    remove_data_dir "$LE_DIR"
     info ".env, the project directory and Docker were kept"
-    info "remember to remove the fake-webapp location from your nginx config"
 }
 
 # --- main ---------------------------------------------------------------------------------------------------
@@ -1153,7 +1582,7 @@ main() {
                 shift
                 ;;
             --with=*) WITH_EXT="${1#--with=}" ;;
-            install | start | stop | restart | status | logs | snippet | remove | extensions)
+            install | start | stop | restart | status | logs | renew | remove | extensions)
                 [[ -z "$cmd" ]] || die "only one command allowed (got '$cmd' and '$1')"
                 cmd="$1"
                 ;;
